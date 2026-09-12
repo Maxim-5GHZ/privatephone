@@ -1,0 +1,34 @@
+# env / secrets
+.env
+.env.local
+*.pem
+data/
+
+# node
+node_modules/
+frontend/dist/
+
+# go
+server/bin/
+server/tmp/
+
+# generated (rebuilt by `make build` / `make gentiles`)
+server/internal/web/dist/*
+!server/internal/web/dist/.gitkeep
+server/internal/web/tiles/*
+!server/internal/web/tiles/.gitkeep
+
+# builds
+build/
+
+# sqlite
+*.db
+*.db-shm
+*.db-wal
+
+# misc
+*.log
+.DS_Store
+.idea/
+.vscode/
+*.tsbuildinfo

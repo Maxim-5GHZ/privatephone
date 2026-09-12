@@ -1,0 +1,91 @@
+package crypto
+
+import (
+	"crypto/ecdsa"
+	"crypto/rand"
+	"crypto/sha256"
+	"encoding/base64"
+	"strconv"
+	"strings"
+	"sync"
+	"time"
+)
+
+// Canonical produces the exact byte string that is signed and verified on both
+// the client (WebCrypto) and the server. The body is the raw JSON bytes of the
+// "data" payload — nothing is reformatted, so bytes are identical on both ends.
+func Canonical(kind, sender, nonce string, ts int64, body []byte) []byte {
+	var b strings.Builder
+	b.Grow(len(body) + 128)
+	b.WriteString("v=1\n")
+	b.WriteString("kind=")
+	b.WriteString(kind)
+	b.WriteByte('\n')
+	b.WriteString("sender=")
+	b.WriteString(sender)
+	b.WriteByte('\n')
+	b.WriteString("ts=")
+	b.WriteString(strconv.FormatInt(ts, 10))
+	b.WriteByte('\n')
+	b.WriteString("nonce=")
+	b.WriteString(nonce)
+	b.WriteByte('\n')
+	b.Write(body)
+	return []byte(b.String())
+}
+
+// Sign returns base64(std) ECDSA-SHA256 signature of canonical bytes.
+func Sign(priv *ecdsa.PrivateKey, canonical []byte) (string, error) {
+	hash := sha256.Sum256(canonical)
+	sig, err := ecdsa.SignASN1(rand.Reader, priv, hash[:])
+	if err != nil {
+		return "", err
+	}
+	return base64.StdEncoding.EncodeToString(sig), nil
+}
+
+// Verify checks base64(std) ECDSA signature over canonical bytes.
+func Verify(pub *ecdsa.PublicKey, canonical []byte, sigB64 string) bool {
+	sig, err := base64.StdEncoding.DecodeString(sigB64)
+	if err != nil {
+		return false
+	}
+	hash := sha256.Sum256(canonical)
+	return ecdsa.VerifyASN1(pub, hash[:], sig)
+}
+
+const maxClockSkew = 10 * time.Minute
+
+// ReplayGuard rejects replayed nonces and out-of-window timestamps.
+type ReplayGuard struct {
+	mu   sync.Mutex
+	seen map[string]int64
+	max  int
+}
+
+func NewReplayGuard(max int) *ReplayGuard {
+	return &ReplayGuard{seen: make(map[string]int64), max: max}
+}
+
+// Check reports whether the (nonce, ts) pair is fresh and accepted.
+func (g *ReplayGuard) Check(nonce string, ts int64) bool {
+	now := time.Now().Unix()
+	if ts < now-int64(maxClockSkew/time.Second) || ts > now+int64(maxClockSkew/time.Second) {
+		return false
+	}
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if _, dup := g.seen[nonce]; dup {
+		return false
+	}
+	g.seen[nonce] = ts
+	if len(g.seen) > g.max {
+		cutoff := now - int64(maxClockSkew/time.Second)
+		for n, t := range g.seen {
+			if t < cutoff {
+				delete(g.seen, n)
+			}
+		}
+	}
+	return true
+}

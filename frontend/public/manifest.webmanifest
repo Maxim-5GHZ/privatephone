@@ -1,0 +1,18 @@
+{
+  "name": "ПАК АСК — защищённый обмен данными",
+  "short_name": "ПАК АСК",
+  "description": "Offline-меш защищённого обмена: карта, чат, PTT. Доступ только по ключу с USB-носителя.",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#0e1420",
+  "theme_color": "#0e1420",
+  "lang": "ru",
+  "icons": [
+    {
+      "src": "/icon.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "any"
+    }
+  ]
+}

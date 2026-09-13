@@ -232,6 +232,7 @@ func (s *Server) handleSubscriberStatus(w http.ResponseWriter, r *http.Request, 
 		Signature: ev.Signature, Data: ev.Data,
 	}
 	s.hub.Journal(r.Context(), f, "@system")
+	s.hub.MarkRevoked(req.Callsign, revoke)
 	if revoke {
 		s.hub.Kick(req.Callsign)
 	}

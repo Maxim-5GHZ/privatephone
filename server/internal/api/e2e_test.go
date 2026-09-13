@@ -53,7 +53,7 @@ func setup(t *testing.T) *testCtx {
 	}
 
 	ver := &protocol.Verifier{
-		Guard: crypto.NewReplayGuard(10000),
+		Guard: crypto.NewReplayGuard(10000, crypto.DefaultSkewWindow),
 		Subs: func(ctx context.Context, callsign string) (string, string, error) {
 			sub, err := st.SubscriberByCallsign(ctx, callsign)
 			if err != nil {

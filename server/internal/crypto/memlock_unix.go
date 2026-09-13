@@ -13,3 +13,8 @@ func mlock(b []byte) {
 func munlock(b []byte) {
 	_ = syscall.Munlock(b)
 }
+
+// pageAlignedAlloc returns a plain buffer; Unix mlock folds in rounding.
+func pageAlignedAlloc(n int) []byte {
+	return make([]byte, n)
+}

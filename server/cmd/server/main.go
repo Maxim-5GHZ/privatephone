@@ -67,8 +67,10 @@ func usage() {
 
 usage:
   pp init [-key PATH] [-data DIR] [-admin-out PATH] [-ips 192.168.1.10,..] [-no-tls]
-      первичное развёртывание: создаёт мастер-ключ на USB, базу, ключ администратора
-      и самоподписанный TLS-сертификат для обращения по HTTPS (IP — через -ips).
+      первичное развёртывание: создаёт мастер-ключ на USB, базу, ключ администратора,
+      внутренний CA (data/ca.crt) и TLS-сертификат узла от этого CA для HTTPS/WSS
+      (IP — через -ips). Корень CA импортируется в доверенные один раз на всё абонентские
+      устройства; -no-tls пропускает генерацию сертификатов.
 
   pp run [-port :8080] [-data DIR] -key PATH [(-watch|--no-watch)] [-persist 5s] [-tls]
       запуск узла связи. Ключ обязан находиться на USB-носителе.
@@ -167,15 +169,23 @@ func cmdInit(args []string) {
 	}
 	certPath := filepath.Join(*data, "tls.crt")
 	keyPath := filepath.Join(*data, "tls.key")
+	caCertPath := filepath.Join(*data, "ca.crt")
+	caKeyPath := filepath.Join(*data, "ca.key")
 	if _, err := os.Stat(certPath); err == nil {
 		fmt.Println("tls: certificate already exists, skipped")
 		return
 	}
-	if err := crypto.WriteSelfSignedTLSCert(certPath, keyPath, splitCSV(*ips), "ПАК АСК offline node"); err != nil {
+	if _, err := os.Stat(caCertPath); err != nil {
+		if err := crypto.WriteCACert(caCertPath, caKeyPath, "PrivatePhone Mesh CA"); err != nil {
+			log.Fatalf("init: ca: %v", err)
+		}
+		fmt.Printf("tls: mesh CA written (%s, %s)\n", caCertPath, caKeyPath)
+	}
+	if err := crypto.WriteServerTLSCert(caCertPath, caKeyPath, certPath, keyPath, splitCSV(*ips), "ПАК АСК offline node"); err != nil {
 		log.Fatalf("init: tls: %v", err)
 	}
-	fmt.Printf("tls: self-signed certificate written (%s, %s)\n", certPath, keyPath)
-	fmt.Println("tls: enable with 'pp run -tls'; import data/tls.crt as trusted on subscriber devices to allow https/wss (WebRTC needs a secure context)")
+	fmt.Printf("tls: node certificate written (%s, %s)\n", certPath, keyPath)
+	fmt.Println("tls: enable with 'pp run -tls'; import data/ca.crt as a trusted root on subscriber devices — one root covers the whole mesh (https/wss + WebRTC secure context)")
 }
 
 func splitCSV(s string) []string {
@@ -388,7 +398,7 @@ func cmdVaultBackup(args []string) {
 	}
 	mk.Destroy()
 
-	names := []string{"vault.db", "tls.crt", "tls.key", "admin.pem"}
+	names := []string{"vault.db", "tls.crt", "tls.key", "ca.crt", "ca.key", "admin.pem"}
 	if err := os.MkdirAll(filepath.Dir(*out), 0o700); err != nil {
 		log.Fatalf("vault-backup: out dir: %v", err)
 	}
@@ -555,6 +565,8 @@ func cmdRun(args []string) {
 	key := fs.String("key", "", "master key file on the USB flash (required)")
 	watch := fs.Bool("watch", true, "kill the process when the USB flash is removed")
 	persistEvery := fs.Duration("persist", 5*time.Second, "vault persist interval")
+	skew := fs.Duration("clock-skew", crypto.DefaultSkewWindow, "freshness window for packet timestamps")
+	calibrate := fs.Bool("clock-calibrate", false, "track the clock offset from admin packets")
 	tls := fs.Bool("tls", false, "serve HTTPS/WSS using <data>/tls.crt and <data>/tls.key")
 	parse(fs, args)
 
@@ -590,7 +602,7 @@ func cmdRun(args []string) {
 	}()
 
 	ver := &protocol.Verifier{
-		Guard: crypto.NewReplayGuard(10000),
+		Guard: crypto.NewReplayGuard(10000, *skew),
 		Subs: func(ctx context.Context, callsign string) (string, string, error) {
 			sub, err := st.SubscriberByCallsign(ctx, callsign)
 			if err != nil {
@@ -601,6 +613,10 @@ func cmdRun(args []string) {
 			}
 			return sub.PubKey, sub.Role, nil
 		},
+	}
+	if *calibrate {
+		ver.Skew = crypto.NewClockOffset()
+		log.Printf("clock calibration enabled: learning offset from admin packets (max ±%s)", crypto.MaxClockCorrection)
 	}
 
 	hub := ws.NewHub(st, ver)

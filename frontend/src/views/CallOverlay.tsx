@@ -11,12 +11,13 @@ export interface CallUi {
 interface Props {
   call: CallUi
   remote: MediaStream | null
+  secure: boolean
   onAccept: () => void
   onReject: () => void
   onHangup: () => void
 }
 
-export function CallOverlay({ call, remote, onAccept, onReject, onHangup }: Props) {
+export function CallOverlay({ call, remote, secure, onAccept, onReject, onHangup }: Props) {
   const audioRef = useRef<HTMLAudioElement>(null)
 
   useEffect(() => {
@@ -43,6 +44,9 @@ export function CallOverlay({ call, remote, onAccept, onReject, onHangup }: Prop
         <h2>{ringing ? 'Входящий вызов' : 'Вызов'}</h2>
         <p className="phone">{call.peer ?? ''}</p>
         <p className="muted">
+          {call.state === 'calling' || call.state === 'connecting' || call.state === 'in-call'
+            ? `${secure ? '\u{1F512} E2EE' : 'без E2EE'} · `
+            : ''}
           {ringing
             ? 'Пользователь звонит вам…'
             : call.state === 'calling'

@@ -41,7 +41,7 @@ func newTestHub(t *testing.T) (*Hub, *db.Store, *ecdsa.PrivateKey, *ecdsa.Privat
 	}
 
 	ver := &protocol.Verifier{
-		Guard: crypto.NewReplayGuard(10000),
+		Guard: crypto.NewReplayGuard(10000, crypto.DefaultSkewWindow),
 		Subs: func(ctx context.Context, callsign string) (string, string, error) {
 			sub, err := st.SubscriberByCallsign(ctx, callsign)
 			if err != nil {
@@ -168,6 +168,95 @@ func TestDispatchAllKinds(t *testing.T) {
 	if _, err := st.ZoneByNonce(ctx, "bob", "z1"); !errors.Is(err, db.ErrNotFound) {
 		t.Fatalf("zone must be deactivated after zone_delete, got %v", err)
 	}
+}
+
+func TestDeliverSkipsRevoked(t *testing.T) {
+	h, _, _, _ := newTestHub(t)
+	bobC := attachHubClient(t, h, "bob")
+	charlieC := attachHubClient(t, h, "charlie")
+
+	h.MarkRevoked("bob", true)
+
+	h.deliver([]byte(`{"kind":"broadcast"}`), nil, "nobody")
+	h.deliver([]byte(`{"kind":"direct_charlie"}`), []string{"charlie"}, "nobody")
+	h.deliver([]byte(`{"kind":"group"}`), []string{"charlie", "bob"}, "nobody")
+
+	select {
+	case b := <-bobC.send:
+		t.Fatalf("revoked bob must receive nothing, got %s", b)
+	default:
+	}
+
+	var charlieGot []string
+	for len(charlieGot) < 3 {
+		select {
+		case b := <-charlieC.send:
+			charlieGot = append(charlieGot, string(b))
+		case <-time.After(1 * time.Second):
+			t.Fatalf("charlie must still receive deliveries, got %v", charlieGot)
+		}
+	}
+	for _, want := range []string{"broadcast", "direct_charlie", "group"} {
+		seen := false
+		for _, g := range charlieGot {
+			if strings.Contains(g, want) {
+				seen = true
+			}
+		}
+		if !seen {
+			t.Fatalf("charlie never received %s; got %v", want, charlieGot)
+		}
+	}
+
+	h.MarkRevoked("bob", false)
+	h.deliver([]byte(`{"kind":"after_unrevoke"}`), nil, "nobody")
+	select {
+	case b := <-bobC.send:
+		if !strings.Contains(string(b), "after_unrevoke") {
+			t.Fatalf("unrevoked bob must come back online, got %s", b)
+		}
+	case <-time.After(1 * time.Second):
+		t.Fatal("unrevoked bob must be served again")
+	}
+}
+
+// TestReplayRevokeMaintainsRoster verifies that CRL entries applied through the
+// sneaker-net import path also update the in-memory delivery roster.
+func TestReplayRevokeMaintainsRoster(t *testing.T) {
+	h, st, _, _ := newTestHub(t)
+	ctx := context.Background()
+	adminPriv, err := crypto.GenerateKeyPair()
+	if err != nil {
+		t.Fatal(err)
+	}
+	adminPubPEM, _ := crypto.PublicKeyToPEM(&adminPriv.PublicKey)
+	if err := st.AddSubscriber(ctx, "id3", "boss", "admin", string(adminPubPEM)); err != nil {
+		t.Fatal(err)
+	}
+	body, _ := json.Marshal(map[string]string{"callsign": "bob"})
+	nonce, _ := crypto.NewID()
+	ts := time.Now().Unix()
+	sig, _ := crypto.Sign(adminPriv, crypto.Canonical("revoke_subscriber", "boss", nonce, ts, body))
+	f := protocol.Frame{Sender: "boss", TS: ts, Nonce: nonce, Kind: "revoke_subscriber", Signature: sig, Data: body}
+	if err := h.replayRevoke(ctx, f, "admin"); err != nil {
+		t.Fatalf("replayRevoke: %v", err)
+	}
+	if !h.isRevoked("bob") {
+		t.Fatal("imported CRL must mark the roster")
+	}
+	sub, err := st.SubscriberByCallsign(ctx, "bob")
+	if err != nil || sub.Revoked == 0 {
+		t.Fatalf("store must already consider bob revoked, sub=%+v err=%v", sub, err)
+	}
+}
+
+func newPriv(t *testing.T) *ecdsa.PrivateKey {
+	t.Helper()
+	k, err := crypto.GenerateKeyPair()
+	if err != nil {
+		t.Fatal(err)
+	}
+	return k
 }
 
 func TestDispatchRejectsMalformedAndImpostors(t *testing.T) {

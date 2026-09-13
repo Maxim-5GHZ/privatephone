@@ -130,8 +130,10 @@ export default function App() {
   const [notice, setNotice] = useState<string | null>(null)
   const [toasts, setToasts] = useState<{ id: number; text: string }[]>([])
   const [call, setCall] = useState<CallUi>({ state: 'idle', peer: null, incoming: false, error: null })
+  const [callSecure, setCallSecure] = useState(false)
   const [remote, setRemote] = useState<MediaStream | null>(null)
   const [pttOpen, setPttOpen] = useState(false)
+  const [pttSecure, setPttSecure] = useState(false)
   const [pttSession, setPttSession] = useState<string[] | null>(null)
   const [pttTalker, setPttTalker] = useState<string | null>(null)
   const [pttTalking, setPttTalking] = useState(false)
@@ -146,6 +148,13 @@ export default function App() {
     for (const s of subscribers) m.set(s.callsign, s.pubkey || '')
     return m
   }, [subscribers])
+
+  // Live public-key map for the call/PTT controllers: they are created once
+  // per login, but the subscriber roster loads asynchronously afterwards.
+  const pubsRef = useRef(new Map<string, string>())
+  useEffect(() => {
+    pubsRef.current = pubs
+  }, [pubs])
 
   // Collect every opaque E2EE envelope currently in state and decrypt them in
   // the background; leaves are hydrated once, then cached for the session.
@@ -403,11 +412,15 @@ export default function App() {
   useEffect(() => {
     if (!callsign || contRef.current) return
     contRef.current = new CallController({
+      me: callsign,
       send: (p) => wsRef.current?.send(p),
       onState: (state: CallState) => setCall((prev) => ({ ...prev, state })),
       onRemote: (stream) => setRemote(stream),
       onIncoming: (peer) => setCall((prev) => ({ ...prev, incoming: true, peer })),
       onError: (msg) => setNotice(msg),
+      onLink: (secure) => setCallSecure(secure),
+      myPub: () => pubsRef.current.get(callsign) ?? '',
+      peerPub: (cs) => pubsRef.current.get(cs) ?? null,
     })
     pttRef.current = new PttController({
       send: (p) => wsRef.current?.send(p),
@@ -418,6 +431,9 @@ export default function App() {
       },
       onTalking: (from) => setPttTalker(from),
       onError: (msg) => setNotice(msg),
+      onLink: (secure) => setPttSecure(secure),
+      myPub: () => pubsRef.current.get(callsign) ?? '',
+      peerPub: (cs) => pubsRef.current.get(cs) ?? null,
     })
   }, [callsign])
 
@@ -435,7 +451,7 @@ export default function App() {
     if (callsign && pubs.get(callsign)) union.set(callsign, pubs.get(callsign)!)
     const members = Array.from(union, ([cs, pubPEM]) => ({ callsign: cs, pubPEM }))
     if (members.length === 0) throw new Error('Нет известных ключей получателей')
-    const env = await encrypt(getEcdhKey()!, members, JSON.stringify(plaintext))
+    const env = await encrypt(members, JSON.stringify(plaintext))
     return apiPost(path, kind, { n: nonce(), recipient, enc: env })
   }
 
@@ -617,7 +633,9 @@ export default function App() {
     setOnline([])
     setRemote(null)
     setCall({ state: 'idle', peer: null, incoming: false, error: null })
+    setCallSecure(false)
     setPttOpen(false)
+    setPttSecure(false)
     setPttSession(null)
     setPttTalker(null)
     setPttTalking(false)
@@ -679,6 +697,7 @@ export default function App() {
           session={pttSession}
           talker={pttTalker}
           talkingMe={pttTalking}
+          secure={pttSecure}
           onStart={startPtt}
           onKey={keyPtt}
           onEnd={endPtt}
@@ -718,7 +737,7 @@ export default function App() {
         />
       )}
 
-      <CallOverlay call={call} remote={remote} onAccept={acceptCall} onReject={rejectCall} onHangup={hangupCall} />
+      <CallOverlay call={call} remote={remote} secure={callSecure} onAccept={acceptCall} onReject={rejectCall} onHangup={hangupCall} />
     </div>
   )
 }

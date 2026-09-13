@@ -5,6 +5,7 @@ import (
 	"crypto/ecdsa"
 	"encoding/json"
 	"errors"
+	"time"
 
 	"privatephone/server/internal/crypto"
 )
@@ -60,15 +61,18 @@ type SubscriberLookup func(ctx context.Context, callsign string) (pubKeyPEM, rol
 type Verifier struct {
 	Guard *crypto.ReplayGuard
 	Subs  SubscriberLookup
+	// Skew, when set, learns the node-vs-network clock offset from admin
+	// packets and applies it to the freshness window (offline drift, no NTP).
+	Skew *crypto.ClockOffset
 }
 
-// Verify returns the caller's role when the packet is authentic.
+// Verify returns the caller's role when the packet is authentic. The
+// signature is checked before the replay guard so that the clock estimator
+// can learn from a verified admin packet, and so unauthenticated junk never
+// pollutes the nonce cache.
 func (v *Verifier) Verify(ctx context.Context, ev *Envelope) (string, error) {
 	if ev == nil || ev.Sender == "" || ev.Kind == "" || ev.Nonce == "" || ev.Signature == "" {
 		return "", ErrBadSignature
-	}
-	if !v.Guard.Check(ev.Nonce, ev.TS) {
-		return "", ErrReplay
 	}
 	role, pub, err := v.lookup(ctx, ev.Sender)
 	if err != nil {
@@ -76,6 +80,16 @@ func (v *Verifier) Verify(ctx context.Context, ev *Envelope) (string, error) {
 	}
 	if !crypto.Verify(pub, ev.Canonical(), ev.Signature) {
 		return "", ErrBadSignature
+	}
+	now := time.Now()
+	if v.Skew != nil {
+		if role == "admin" {
+			v.Skew.Observe(now, ev.TS)
+		}
+		now = v.Skew.AdjustedNow(now)
+	}
+	if !v.Guard.CheckAt(now.Unix(), ev.Nonce, ev.TS) {
+		return "", ErrReplay
 	}
 	return role, nil
 }

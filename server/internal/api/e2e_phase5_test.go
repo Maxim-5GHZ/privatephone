@@ -197,7 +197,7 @@ func decrypt(t *testing.T, me *ecdsa.PrivateKey, senderPub *ecdsa.PublicKey, env
 func serverFor(t *testing.T, st *db.Store, adminPEM string) *testCtx {
 	t.Helper()
 	ver := &protocol.Verifier{
-		Guard: crypto.NewReplayGuard(10000),
+		Guard: crypto.NewReplayGuard(10000, crypto.DefaultSkewWindow),
 		Subs: func(ctx context.Context, callsign string) (string, string, error) {
 			sub, err := st.SubscriberByCallsign(ctx, callsign)
 			if err != nil {

@@ -95,6 +95,13 @@ func allZero(b []byte) bool {
 	return true
 }
 
+func TestCreateMasterKeyFailsOnUnwritable(t *testing.T) {
+	_, err := CreateMasterKey(t.TempDir()) // writing into a directory must fail
+	if err == nil {
+		t.Fatal("master key creation must fail when the carrier path is unwritable")
+	}
+}
+
 func TestWriteSelfSignedTLSCert(t *testing.T) {
 	dir := t.TempDir()
 	certPath := filepath.Join(dir, "tls.crt")

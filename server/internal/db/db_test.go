@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 )
 
 func testKey(t *testing.T) []byte {
@@ -133,4 +134,57 @@ func mutateFile(path string) error {
 	}
 	b[len(b)-1] ^= 0xff
 	return os.WriteFile(path, b, 0o600)
+}
+
+func TestOpenRejectsBadKeyLength(t *testing.T) {
+	dir := t.TempDir()
+	if _, err := Open(dir, []byte("short")); err == nil {
+		t.Fatal("a non-32-byte key must be rejected")
+	}
+}
+
+func TestPersistNoOpPaths(t *testing.T) {
+	dir := t.TempDir()
+	key := testKey(t)
+	ctx := context.Background()
+
+	st, err := Open(dir, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := st.Persist(ctx); err != nil {
+		t.Fatalf("persist before any write must be a no-op, got %v", err)
+	}
+	if err := st.Close(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	// After a clean Close the store is sealed and clean: Open+Close again takes
+	// the finalSeal no-op path (dirty=false, sealed=true).
+	st2, err := Open(dir, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := st2.Close(ctx); err != nil {
+		t.Fatalf("clean reopen close: %v", err)
+	}
+}
+
+func TestPersistentEveryCancels(t *testing.T) {
+	dir := t.TempDir()
+	key := testKey(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	st, err := Open(dir, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	st.PersistentEvery(ctx, 5*time.Millisecond)
+	time.Sleep(20 * time.Millisecond)
+	cancel()
+	if _, err := st.ListZones(context.Background()); err != nil {
+		t.Fatalf("store must stay usable after the persist loop stops: %v", err)
+	}
+	if err := st.Close(context.Background()); err != nil {
+		t.Fatal(err)
+	}
 }

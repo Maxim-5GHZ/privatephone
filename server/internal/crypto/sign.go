@@ -54,23 +54,36 @@ func Verify(pub *ecdsa.PublicKey, canonical []byte, sigB64 string) bool {
 	return ecdsa.VerifyASN1(pub, hash[:], sig)
 }
 
-const maxClockSkew = 10 * time.Minute
-
 // ReplayGuard rejects replayed nonces and out-of-window timestamps.
 type ReplayGuard struct {
-	mu   sync.Mutex
-	seen map[string]int64
-	max  int
+	mu     sync.Mutex
+	seen   map[string]int64
+	max    int
+	window time.Duration
 }
 
-func NewReplayGuard(max int) *ReplayGuard {
-	return &ReplayGuard{seen: make(map[string]int64), max: max}
+// DefaultSkewWindow is the default freshness window: how far a packet
+// timestamp may be from "now" before it is judged replayed or stale.
+const DefaultSkewWindow = 10 * time.Minute
+
+// NewReplayGuard returns a guard that accepts packets within window of the
+// caller's clock (default 10 minutes). Use CheckAt to supply an offset clock.
+func NewReplayGuard(max int, window time.Duration) *ReplayGuard {
+	if window <= 0 {
+		window = DefaultSkewWindow
+	}
+	return &ReplayGuard{seen: make(map[string]int64), max: max, window: window}
 }
 
-// Check reports whether the (nonce, ts) pair is fresh and accepted.
+// Check reports whether the (nonce, ts) pair is fresh using the real clock.
 func (g *ReplayGuard) Check(nonce string, ts int64) bool {
-	now := time.Now().Unix()
-	if ts < now-int64(maxClockSkew/time.Second) || ts > now+int64(maxClockSkew/time.Second) {
+	return g.CheckAt(time.Now().Unix(), nonce, ts)
+}
+
+// CheckAt reports whether the (nonce, ts) pair is fresh when the caller's
+// notion of "now" is nowSec (Unix seconds), possibly adjusted by a ClockOffset.
+func (g *ReplayGuard) CheckAt(nowSec int64, nonce string, ts int64) bool {
+	if ts < nowSec-int64(g.window/time.Second) || ts > nowSec+int64(g.window/time.Second) {
 		return false
 	}
 	g.mu.Lock()
@@ -80,7 +93,7 @@ func (g *ReplayGuard) Check(nonce string, ts int64) bool {
 	}
 	g.seen[nonce] = ts
 	if len(g.seen) > g.max {
-		cutoff := now - int64(maxClockSkew/time.Second)
+		cutoff := nowSec - int64(g.window/time.Second)
 		for n, t := range g.seen {
 			if t < cutoff {
 				delete(g.seen, n)

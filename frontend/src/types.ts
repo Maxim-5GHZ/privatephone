@@ -93,20 +93,20 @@ export type WSMsg =
   | { kind: 'zone_updated'; data: Zone }
   | { kind: 'zone_deleted'; data: { sender: string; n: string; id?: number } }
   | { kind: 'presence'; data: { online: string[] } }
-  | { kind: 'call_invite'; sender: string; data: { to: string; sdp: SdpData } }
-  | { kind: 'call_accept'; sender: string; data: { to: string; sdp: SdpData } }
+  | { kind: 'call_invite'; sender: string; data: { to: string; enc?: unknown } }
+  | { kind: 'call_accept'; sender: string; data: { to: string; enc?: unknown } }
   | { kind: 'call_reject'; sender: string; data: { to: string } }
   | { kind: 'call_bye'; sender: string; data: { to: string } }
-  | { kind: 'ice'; sender: string; data: { to: string; candidate: IceCandidate } }
+  | { kind: 'ice'; sender: string; data: { to: string; enc?: unknown } }
   | {
       kind: 'ptt_start' | 'ptt_end' | 'ptt_talking' | 'ptt_offer' | 'ptt_answer' | 'ptt_ice'
       sender: string
       data: {
         n?: string
         to?: string | string[]
-        sdp?: SdpData
-        candidate?: IceCandidate
         talks?: string
+        /** sealed SDP/ICE/SFrame-share envelope (see crypto/signal.ts) */
+        enc?: unknown
       }
     }
   | { kind: 'call_error'; data: { to: string; error?: string } }

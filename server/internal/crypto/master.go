@@ -28,7 +28,7 @@ func LoadMasterKey(path string) (*MasterKey, error) {
 	if len(data) != masterKeySize {
 		return nil, fmt.Errorf("bad master key size: got %d bytes, want %d", len(data), masterKeySize)
 	}
-	buf := make([]byte, masterKeySize)
+	buf := pageAlignedAlloc(masterKeySize)
 	copy(buf, data)
 	clear(data)
 	mlock(buf)
@@ -37,7 +37,7 @@ func LoadMasterKey(path string) (*MasterKey, error) {
 
 // CreateMasterKey writes a fresh random key to the removable medium.
 func CreateMasterKey(path string) (*MasterKey, error) {
-	buf := make([]byte, masterKeySize)
+	buf := pageAlignedAlloc(masterKeySize)
 	if _, err := rand.Read(buf); err != nil {
 		return nil, err
 	}

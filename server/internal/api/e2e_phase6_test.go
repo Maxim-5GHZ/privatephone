@@ -265,7 +265,7 @@ func TestServeTLS(t *testing.T) {
 	ln.Close()
 
 	ver := &protocol.Verifier{
-		Guard: crypto.NewReplayGuard(10000),
+		Guard: crypto.NewReplayGuard(10000, crypto.DefaultSkewWindow),
 		Subs: func(ctx context.Context, callsign string) (string, string, error) {
 			sub, err := srv.st.SubscriberByCallsign(ctx, callsign)
 			if err != nil {

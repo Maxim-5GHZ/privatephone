@@ -6,6 +6,7 @@
   --muted: #8ba0bd;
   --accent: #4f9dff;
   --danger: #ef4444;
+  --ok: #54c76a;
 }
 
 * {
@@ -190,6 +191,35 @@ textarea {
 .login .hint {
   font-size: 12px;
   color: var(--muted);
+}
+
+.login input[type='file'] {
+  display: none;
+}
+
+.dropzone {
+  border: 1.5px dashed var(--accent);
+  border-radius: 8px;
+  padding: 18px 14px;
+  text-align: center;
+  color: var(--accent);
+  font-size: 13px;
+  background: transparent;
+  cursor: pointer;
+  transition: background 0.15s, border-color 0.15s;
+}
+
+.dropzone.drag {
+  background: color-mix(in srgb, var(--accent) 12%, transparent);
+  border-style: solid;
+}
+
+.login .fingerprint {
+  font-size: 12px;
+  letter-spacing: 0.5px;
+  color: var(--ok);
+  margin: -2px 0 0;
+  text-align: center;
 }
 
 /* map */
@@ -617,6 +647,17 @@ textarea {
 .ptt-panel h3 {
   margin: 0;
   font-size: 14px;
+}
+
+.ptt-panel h3 .lock {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--ok);
+  margin-left: 4px;
+}
+
+.ptt-panel h3 .lock.warn {
+  color: #e8b64c;
 }
 
 .ptt-list {

@@ -6,6 +6,7 @@ interface Props {
   session: string[] | null
   talker: string | null
   talkingMe: boolean
+  secure: boolean
   onStart: (targets: string[]) => void
   onKey: (on: boolean) => void
   onEnd: () => void
@@ -17,7 +18,7 @@ function chips(members: string[], myCallsign: string) {
   return [...new Set([myCallsign, ...members])].slice(0, MAX_MEMBERS)
 }
 
-export function PttPanel({ online, myCallsign, session, talker, talkingMe, onStart, onKey, onEnd }: Props) {
+export function PttPanel({ online, myCallsign, session, talker, talkingMe, secure, onStart, onKey, onEnd }: Props) {
   const [sel, setSel] = useState<string[]>([])
   const members = chips(session ?? [], myCallsign)
 
@@ -32,7 +33,10 @@ export function PttPanel({ online, myCallsign, session, talker, talkingMe, onSta
     }
     return (
       <div className="ptt-panel">
-        <h3>Рация (до {MAX_MEMBERS} абонентов)</h3>
+        <h3>
+          Рация (до {MAX_MEMBERS} абонентов)
+          {secure ? <span className="lock">{'\u{1F512}'} E2EE</span> : <span className="lock warn">без E2EE</span>}
+        </h3>
         {selectorList.length === 0 ? (
           <p className="muted">Сейчас в сети только вы.</p>
         ) : (

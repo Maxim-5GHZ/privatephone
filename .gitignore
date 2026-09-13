@@ -11,15 +11,16 @@ frontend/dist/
 # go
 server/bin/
 server/tmp/
+/server
+
+# builds
+build/
 
 # generated (rebuilt by `make build` / `make gentiles`)
 server/internal/web/dist/*
 !server/internal/web/dist/.gitkeep
 server/internal/web/tiles/*
 !server/internal/web/tiles/.gitkeep
-
-# builds
-build/
 
 # sqlite
 *.db

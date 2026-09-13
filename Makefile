@@ -9,12 +9,15 @@ ADMIN      ?= $(DATA)/admin.pem
 PORT       ?= :8080
 # comma-separated LAN IPs embedded into the self-signed TLS cert SAN (any, e.g. "192.168.1.10")
 IPS        ?=
+# flash folder target: pick a platform via FLASH_OS/FLASH_ARCH (or OS/ARCH aliases)
+FLASH_OS   ?= $(OS)
+FLASH_ARCH ?= $(ARCH)
 
 PLATFORMS := linux/amd64 linux/arm64 windows/amd64 darwin/arm64
 
 .DEFAULT_GOAL := all
 
-.PHONY: help all ui gentiles build run dev init tiles test vet cover cross clean
+.PHONY: help all ui gentiles build run dev init tiles test vet cover cross flash clean
 
 help: ## list targets
 	@grep -E '^[a-zA-Z_-]+:.*?## ' $(MAKEFILE_LIST) | awk 'BEGIN{FS=":.*?## "} {printf "  %-12s %s\n", $$1, $$2}'
@@ -45,6 +48,20 @@ cross: ui gentiles ## binaries for all PLATFORMS -> build/pp-<os>-<arch>[.exe]
 		cd "$(ROOT)/server" && CGO_ENABLED=0 GOOS=$$os GOARCH=$$arch $(GO) build -trimpath -ldflags="-s -w" -o "$(BUILD)/pp-$$os-$$arch$$ext" ./cmd/server || exit 1; \
 	done
 	@ls -lh "$(BUILD)"/pp-*
+
+flash: ## stage a ready-to-copy flash folder: binary + operator memo -> build/flash
+	@os=$(or $(FLASH_OS),$(shell $(GO) env GOOS)); \
+	arch=$(or $(FLASH_ARCH),$(shell $(GO) env GOARCH)); \
+	ext=; [ "$$os" = "windows" ] && ext=".exe"; \
+	src="$(BUILD)/pp-$$os-$$arch$$ext"; \
+	if [ ! -f "$$src" ] && [ "$$os$$arch" = "$(shell $(GO) env GOOS)$(shell $(GO) env GOARCH)" ]; then src="$(BUILD)/pp"; fi; \
+	if [ ! -f "$$src" ]; then echo "error: $$src not found (run: make cross first)"; exit 1; fi; \
+	rm -rf "$(BUILD)/flash"; mkdir -p "$(BUILD)/flash"; \
+	cp "$$src" "$(BUILD)/flash/pp$$ext"; \
+	[ "$$os" != "windows" ] && chmod +x "$(BUILD)/flash/pp$$ext"; \
+	cp "$(ROOT)/scripts/README-FLASH.txt" "$(BUILD)/flash/"; \
+	echo "--- build/flash ---"; \
+	ls -lh "$(BUILD)/flash"
 
 ## --- Deploy / run ------------------------------------------------------------
 

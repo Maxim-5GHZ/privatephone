@@ -69,3 +69,78 @@ func TestUsbKeyResolution(t *testing.T) {
 		}
 	})
 }
+
+func TestResolveRunKey(t *testing.T) {
+	data := filepath.Join(t.TempDir(), "data")
+	if err := os.MkdirAll(data, 0o700); err != nil {
+		t.Fatal(err)
+	}
+
+	t.Run("explicit -key wins", func(t *testing.T) {
+		p, err := resolveRunKey(data, "/abs/path/usb/pp.key", true)
+		if err != nil {
+			t.Fatalf("resolve: %v", err)
+		}
+		if p != "/abs/path/usb/pp.key" {
+			t.Fatalf("expected explicit key, got %s", p)
+		}
+	})
+
+	t.Run("first run: local key next to data", func(t *testing.T) {
+		p, err := resolveRunKey(data, "", false)
+		if err != nil {
+			t.Fatalf("resolve: %v", err)
+		}
+		if want := filepath.Join(data, usbKeyFileName); p != want {
+			t.Fatalf("expected %s, got %s", want, p)
+		}
+	})
+
+	t.Run("reuses local key next to data", func(t *testing.T) {
+		local := filepath.Join(data, usbKeyFileName)
+		if err := os.WriteFile(local, []byte("k"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		p, err := resolveRunKey(data, "", true)
+		if err != nil {
+			t.Fatalf("resolve: %v", err)
+		}
+		if p != local {
+			t.Fatalf("expected %s, got %s", local, p)
+		}
+	})
+
+	t.Run("no local key, vault present -> USB fallback", func(t *testing.T) {
+		if err := os.Remove(filepath.Join(data, usbKeyFileName)); err != nil {
+			t.Fatal(err)
+		}
+		usb := filepath.Join(t.TempDir(), "usb")
+		if err := os.MkdirAll(usb, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		existing := filepath.Join(usb, usbKeyFileName)
+		if err := os.WriteFile(existing, []byte("k"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		prev := removableMounts
+		defer func() { removableMounts = prev }()
+		removableMounts = func() []string { return []string{usb} }
+
+		p, err := resolveRunKey(data, "", true)
+		if err != nil {
+			t.Fatalf("resolve: %v", err)
+		}
+		if p != existing {
+			t.Fatalf("expected %s, got %s", existing, p)
+		}
+	})
+
+	t.Run("no local key, no media -> friendly error", func(t *testing.T) {
+		prev := removableMounts
+		defer func() { removableMounts = prev }()
+		removableMounts = func() []string { return nil }
+		if _, err := resolveRunKey(data, "", true); err == nil {
+			t.Fatal("expected a friendly error")
+		}
+	})
+}

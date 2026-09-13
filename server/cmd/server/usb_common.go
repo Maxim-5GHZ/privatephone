@@ -11,6 +11,18 @@ import (
 // usbKeyFileName is the master-key file name looked for on removable media.
 const usbKeyFileName = "pp.key"
 
+// exeDataDir returns <dir-of-the-binary>/data — the portable "server on a
+// flash" default. Because the data directory (and everything in it) lives
+// next to the binary, launching the binary straight off a USB stick works
+// regardless of the current working directory.
+func exeDataDir() string {
+	exe, err := os.Executable()
+	if err != nil {
+		return filepath.Join(".", "data")
+	}
+	return filepath.Join(filepath.Dir(exe), "data")
+}
+
 // removableMounts is swappable so tests can simulate USB media deterministically.
 var removableMounts = defaultRemovableMounts
 
@@ -43,6 +55,29 @@ func pickUsbForNewKey() (string, error) {
 		}
 	}
 	return filepath.Join(mounts[0], usbKeyFileName), nil
+}
+
+// resolveRunKey picks the master-key path for `pp run` in auto (no -key) mode:
+//
+//  1. an explicit -key flag always wins;
+//  2. <data>/pp.key next to the binary (portable "server on a flash"): reuse
+//     it if it exists; on first run (no vault yet) it is where the fresh key
+//     will be created;
+//  3. a vault exists but there is no local key — legacy fallback: search
+//     removable USB media;
+//  4. otherwise a friendly error telling the operator what to plug in.
+func resolveRunKey(data, keyFlag string, vaultExists bool) (string, error) {
+	if keyFlag != "" {
+		return keyFlag, nil
+	}
+	local := filepath.Join(data, usbKeyFileName)
+	if _, err := os.Stat(local); err == nil {
+		return local, nil
+	}
+	if !vaultExists {
+		return local, nil
+	}
+	return findExistingUsbKey()
 }
 
 // firstLANIPv4 returns the first up, non-loopback, non-link-local IPv4
@@ -89,7 +124,8 @@ func printFirstRun(data, port, scheme, adminOut string, ips []string) {
 	fmt.Println("=== ПЕРВЫЙ ЗАПУСК: всё готово, можно работать ===")
 	fmt.Printf("  1. откройте в браузере:  %s\n", addr)
 	fmt.Printf("  2. вход оператора:  файл  %s  (позывной  admin)\n", adminOut)
-	fmt.Println("  3. на устройствах абонентов один раз импортировать корень")
+	fmt.Printf("  3. данные узла (база) лежат в папке:  %s\n", data)
+	fmt.Println("  4. на устройствах абонентов один раз импортировать корень")
 	fmt.Printf("     %s/ca.crt  (Linux: sudo scripts/install_ca.sh %s/ca.crt; Windows: Import-Certificate)\n", data, data)
 	fmt.Printf("     и открывать %s  — без импорта будет предупреждение браузера.\n", addr)
 	fmt.Println()

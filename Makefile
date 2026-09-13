@@ -14,7 +14,7 @@ PLATFORMS := linux/amd64 linux/arm64 windows/amd64 darwin/arm64
 
 .DEFAULT_GOAL := all
 
-.PHONY: help all ui gentiles build run dev init tiles test vet cover cross dist clean
+.PHONY: help all ui gentiles build run dev init tiles test vet cover cross clean
 
 help: ## list targets
 	@grep -E '^[a-zA-Z_-]+:.*?## ' $(MAKEFILE_LIST) | awk 'BEGIN{FS=":.*?## "} {printf "  %-12s %s\n", $$1, $$2}'
@@ -37,30 +37,14 @@ build: ui gentiles ## single binary for the current host
 	cd "$(ROOT)/server" && CGO_ENABLED=0 $(GO) build -trimpath -ldflags="-s -w" -o "$(BUILD)/pp" ./cmd/server
 	@echo "binary: $(BUILD)/pp"
 
-cross: ui gentiles ## binaries for all PLATFORMS
+cross: ui gentiles ## binaries for all PLATFORMS -> build/pp-<os>-<arch>[.exe]
 	@for p in $(PLATFORMS); do \
 		os=$${p%/*}; arch=$${p#*/}; ext=; \
 		[ "$$os" = "windows" ] && ext=".exe"; \
 		echo ">> $$os/$$arch"; \
-		cd "$(ROOT)/server" && CGO_ENABLED=0 GOOS=$$os GOARCH=$$arch $(GO) build -trimpath -ldflags="-s -w" -o "$(BUILD)/pp-$$os-$$arch$$ext" ./cmd/server; \
+		cd "$(ROOT)/server" && CGO_ENABLED=0 GOOS=$$os GOARCH=$$arch $(GO) build -trimpath -ldflags="-s -w" -o "$(BUILD)/pp-$$os-$$arch$$ext" ./cmd/server || exit 1; \
 	done
 	@ls -lh "$(BUILD)"/pp-*
-
-dist: cross ## operator bundles (zip per platform): binary + start.* + README
-	rm -rf "$(BUILD)/dist"
-	@for p in $(PLATFORMS); do \
-		os=$${p%/*}; arch=$${p#*/}; ext=; \
-		[ "$$os" = "windows" ] && ext=".exe"; \
-		dir="$(BUILD)/dist/privatephone-$$os-$$arch"; \
-		mkdir -p "$$dir"; \
-		cp "$(BUILD)/pp-$$os-$$arch$$ext" "$$dir/pp$$ext"; \
-		[ "$$os" != "windows" ] && chmod +x "$$dir/pp$$ext"; \
-		cp "$(ROOT)/scripts/start.sh" "$(ROOT)/scripts/start.bat" "$(ROOT)/scripts/README-RUN.txt" "$$dir/"; \
-		cd "$$dir" && zip -q "$(BUILD)/privatephone-$$os-$$arch.zip" pp$$ext start.sh start.bat README-RUN.txt && cd "$(ROOT)"; \
-		rm -rf "$$dir"; \
-		echo "bundle: $(BUILD)/privatephone-$$os-$$arch.zip"; \
-	done
-	@echo "---"; ls -lh "$(BUILD)"/privatephone-*.zip
 
 ## --- Deploy / run ------------------------------------------------------------
 

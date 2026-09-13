@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 	"time"
 )
 
@@ -37,6 +38,11 @@ func LoadMasterKey(path string) (*MasterKey, error) {
 
 // CreateMasterKey writes a fresh random key to the removable medium.
 func CreateMasterKey(path string) (*MasterKey, error) {
+	if dir := filepath.Dir(path); dir != "." {
+		if err := os.MkdirAll(dir, 0o700); err != nil {
+			return nil, err
+		}
+	}
 	buf := pageAlignedAlloc(masterKeySize)
 	if _, err := rand.Read(buf); err != nil {
 		return nil, err

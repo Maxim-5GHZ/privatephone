@@ -21,7 +21,7 @@ func defaultRemovableMounts() []string {
 		if err != nil {
 			continue
 		}
-		if t, err := windows.GetDriveTypeW(ut); err == nil && t == driveRemovable {
+		if t := windows.GetDriveType(ut); t == driveRemovable {
 			out = append(out, root)
 		}
 	}

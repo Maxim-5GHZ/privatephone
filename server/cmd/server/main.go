@@ -67,17 +67,19 @@ func usage() {
 
 usage:
   pp init [-key PATH] [-data DIR] [-admin-out PATH] [-ips 192.168.1.10,..] [-no-tls]
-      первичное развёртывание: создаёт мастер-ключ на USB, базу, ключ администратора,
+      первичное развёртывание: создаёт мастер-ключ, базу, ключ администратора,
       внутренний CA (data/ca.crt) и TLS-сертификат узла от этого CA для HTTPS/WSS
-      (IP — через -ips). Корень CA импортируется в доверенные один раз на всё абонентские
-      устройства; -no-tls пропускает генерацию сертификатов.
+      (IP — через -ips). Корень CA импортируется в доверенные один раз на все
+      абонентские устройства; -no-tls пропускает генерацию сертификатов.
+      Портативный режим: по умолчанию -data — папка data РЯДОМ с самим бинарником
+      (явная флешка: бинарник, ключ и база лежат вместе), -key — <data>/pp.key
+      там же.
 
   pp run [-port :8080] [-data DIR] [-key PATH] [(-watch|--no-watch)] [-persist 5s] [-tls]
-      запуск узла связи. Ключ обязан находиться на USB-носителе.
-      При извлечении носителя процесс немедленно завершается.
+      запуск узла связи. При извлечении носителя процесс немедленно завершается.
       -tls — слушать HTTPS/WSS (нужен WebRTC-звонкам и доступу по IP).
-      Без -key — "мастер первого запуска": флешка с мастер-ключом ищется
-      автоматически, при отсутствии данных node сам себя инициализирует
+      Без -key — "мастер первого запуска": ключ ищется (создаётся) в <data>/pp.key
+      рядом с бинарником, при отсутствии данных node сам себя инициализирует
       (vault, админ, CA, TLS) и стартует по https.
 
   pp verify-journal [-data DIR] -key PATH
@@ -113,16 +115,15 @@ func parse(fs *flag.FlagSet, args []string) {
 
 func cmdInit(args []string) {
 	fs := flag.NewFlagSet("init", flag.ExitOnError)
-	key := fs.String("key", "", "master key file on the USB flash (created if absent)")
-	data := fs.String("data", "./data", "data directory (encrypted vault lives here)")
+	data := fs.String("data", exeDataDir(), "data directory (default: <dir-of-this-binary>/data — portable mode)")
+	key := fs.String("key", "", "master key file (default <data>/pp.key next to the binary)")
 	adminOut := fs.String("admin-out", "", "file to write the admin private key (default <data>/admin.pem)")
 	ips := fs.String("ips", "", "comma-separated LAN IPs to embed into the TLS certificate (for https/wss access)")
 	noTLS := fs.Bool("no-tls", false, "skip generating the self-signed TLS certificate")
 	parse(fs, args)
 
 	if *key == "" {
-		fmt.Fprintln(os.Stderr, "init: -key is required (path to the USB master key file)")
-		os.Exit(2)
+		*key = filepath.Join(*data, usbKeyFileName)
 	}
 	if *adminOut == "" {
 		*adminOut = filepath.Join(*data, "admin.pem")
@@ -570,8 +571,8 @@ func writeTarFile(tw *tar.Writer, name, path string, fi os.FileInfo) error {
 func cmdRun(args []string) {
 	fs := flag.NewFlagSet("run", flag.ExitOnError)
 	port := fs.String("port", ":8080", "listen address")
-	data := fs.String("data", "./data", "data directory")
-	key := fs.String("key", "", "master key file on the USB flash (required)")
+	data := fs.String("data", exeDataDir(), "data directory (default: <dir-of-this-binary>/data — portable mode)")
+	key := fs.String("key", "", "master key file (default <data>/pp.key next to the binary)")
 	watch := fs.Bool("watch", true, "kill the process when the USB flash is removed")
 	persistEvery := fs.Duration("persist", 5*time.Second, "vault persist interval")
 	skew := fs.Duration("clock-skew", crypto.DefaultSkewWindow, "freshness window for packet timestamps")
@@ -594,23 +595,26 @@ func cmdRun(args []string) {
 	keyPath := *key
 	noKeyFlag := keyPath == ""
 	if noKeyFlag {
-		// Авторежим: мастер-ключ ищем на USB-носителях.
-		if !vaultExists {
-			p, err := pickUsbForNewKey()
-			if err != nil {
-				fmt.Fprintln(os.Stderr, "run:", err)
-				os.Exit(2)
-			}
-			keyPath = p
-		} else {
-			p, err := findExistingUsbKey()
-			if err != nil {
-				fmt.Fprintln(os.Stderr, "run:", err)
-				os.Exit(2)
-			}
-			keyPath = p
+		// Авторежим: ключ рядом с данными (<data>/pp.key, портативная «флешка
+		// сервера»), при его отсутствии — запасной поиск на съёмных носителях.
+		var err error
+		keyPath, err = resolveRunKey(*data, *key, vaultExists)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "run:", err)
+			os.Exit(2)
 		}
-		fmt.Printf("run: master key found on USB: %s\n", keyPath)
+		if !vaultExists {
+			fmt.Printf("run: мастер-ключ будет создан рядом с данными: %s\n", keyPath)
+		} else {
+			fmt.Printf("run: мастер-ключ: %s\n", keyPath)
+		}
+	}
+
+	if noKeyFlag && !tlsSet {
+		// Авторежим — по умолчанию HTTPS (WebRTC нужно secure context) и
+		// инструкции первого запуска должны показать верный адрес https://.
+		*tls = true
+		log.Printf("http: -tls enabled automatically; укажите -tls=false для HTTP")
 	}
 
 	if !vaultExists {
@@ -628,12 +632,6 @@ func cmdRun(args []string) {
 		printFirstRun(*data, *port, scheme, adminOut, ips)
 	} else if _, err := os.Stat(keyPath); err != nil {
 		log.Fatalf("run: master key not found at %s (run 'pp init -key %s' first)", keyPath, keyPath)
-	}
-
-	if noKeyFlag && !tlsSet {
-		// Авторежим — по умолчанию HTTPS (WebRTC нужно secure context).
-		*tls = true
-		log.Printf("http: -tls enabled automatically; укажите -tls=false для HTTP")
 	}
 
 	mk, err := crypto.LoadMasterKey(keyPath)

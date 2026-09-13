@@ -6,7 +6,8 @@
 Каждый пакет подписан закрытым ключом абонента (ECDSA P-256) и проверяется сервером;
 неизвестные или неверно подписанные пакеты отбрасываются.
 **Содержимое**: сообщения, маркеры, тревоги и зоны зашифрованы end-to-end (AES-256-GCM,
-ключ выводится из того же ключа абонента через ECDH) — сервер видит только обёртки-шифротекст.
+на каждый конверт — свой эфемерный ECDH-ключ, forward secrecy) — сервер видит только
+обёртки-шифротекст.
 
 Ноль зависимостей на хосте: без Docker, nginx, Node, внешних СУБД, без выхода в интернет.
 
@@ -53,7 +54,8 @@ make vet
 
 `init` дополнительно создаёт **внутренний CA** (`data/ca.crt` + `data/ca.key`) и подписанный
 им сертификат узла (`data/tls.crt` + `data/tls.key`, SAN = `-ips`). Один корневой сертификат
-покрывает весь узел/полигон — см. «HTTPS/WSS».
+покрывает весь узел/полигон — см. «HTTPS/WSS». Флаг `-no-tls` пропускает генерацию
+сертификатов.
 
 ## Абоненты
 
@@ -67,8 +69,12 @@ make vet
 и повторно импортируется браузером как **ECDH** — для выработки ключей сообщений. Публичные
 ключи уже есть в реестре, поэтому сервер участвует в доставке, но не знает секретов.
 
-- Формат конверта: `{v:1, alg:"A256GCM", iv, c, k:[{to,salt,iv,ek}]}` — msg-key шифрует контент,
-  для каждого получателя msg-key заворачивается в свой `ek` через HKDF("pp-e2ee/v1") с ECDH-секретом.
+- Формат конверта: `{v:2, alg:"A256GCM", epub, iv, c, k:[{to,salt,iv,ek}]}` — msg-key шифрует
+  контент, для каждого получателя msg-key заворачивается в свой `ek`. ECDH-секрет берётся
+  из **эфемерного** ключа отправителя (`epub`, свежий на каждый конверт) и статического
+  ключа получателя через HKDF("pp-e2ee/v2"): компрометация статического ключа в будущем
+  не вскрывает прошлых конвертов (forward secrecy). Легаси-строки `{v:1,...}` (static-static
+  ECDH, HKDF "pp-e2ee/v1") по-прежнему расшифровываются как запасной путь к старым записям.
 - **Самозавёртка**: автор всегда включён в получателей, поэтому и свои собственные пакеты
   он дешифрует тем же путём, что и чужие.
 - Сервер непрозрачен: поля-заглушки (`lat/lon=0`, `type/name="enc"`) + конверт в `desc`/`body`/
@@ -271,9 +277,8 @@ make dev            # Go :8080 + Vite :5173 (прокси /api и /tiles)
 
 ## Ограничения MVP (честно)
 
-- `mlock` хранит ключ только в mlock'нутой RAM под Linux на x86_64/arm64; на прочих
-  платформах (Windows, macOS) защита от выгрузки в swap — best-effort (всё остальное
-  работает).
+- `mlock` удерживает ключ в невыгружаемой памяти: Linux/macOS — `mlock(2)` (best-effort),
+  Windows — `VirtualLock` на странично-выровненных буферах; на остальных ОС — no-op.
 - Ключ для браузера выбирается через file picker (стандарт); автодоступ к USB-флешке
   браузер не имеет — абонент выбирает файл каждый сеанс.
 - Watchdog проверяет файл ключа раз в 1 сек. Монтирование USB обычно требует прав root
@@ -294,8 +299,9 @@ make dev            # Go :8080 + Vite :5173 (прокси /api и /tiles)
 
 ```
 server/cmd/server      main: subcommands init / run / verify-journal /
-                       journal-export / journal-import / vault-backup / vault-restore
-server/internal/crypto ECDSA-подпись, канон-формат, master-key + USB-watchdog
+                       journal-export / journal-import / vault-backup / vault-restore / version
+server/internal/crypto ECDSA-подпись, канон-формат, master-key + USB-watchdog, mlock,
+                       ReplayGuard + clock-offset, внутренний CA и сертификаты узла
 server/internal/db     AES-GCM vault + SQLite в RAM + store-and-forward журнал
 server/internal/protocol Frame/Envelope/Verifier (общий канон с frontend)
 server/internal/ws     WebSocket hub, backlog undelivered-пакетов

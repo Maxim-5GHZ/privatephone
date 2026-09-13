@@ -72,10 +72,13 @@ usage:
       (IP — через -ips). Корень CA импортируется в доверенные один раз на всё абонентские
       устройства; -no-tls пропускает генерацию сертификатов.
 
-  pp run [-port :8080] [-data DIR] -key PATH [(-watch|--no-watch)] [-persist 5s] [-tls]
+  pp run [-port :8080] [-data DIR] [-key PATH] [(-watch|--no-watch)] [-persist 5s] [-tls]
       запуск узла связи. Ключ обязан находиться на USB-носителе.
       При извлечении носителя процесс немедленно завершается.
       -tls — слушать HTTPS/WSS (нужен WebRTC-звонкам и доступу по IP).
+      Без -key — "мастер первого запуска": флешка с мастер-ключом ищется
+      автоматически, при отсутствии данных node сам себя инициализирует
+      (vault, админ, CA, TLS) и стартует по https.
 
   pp verify-journal [-data DIR] -key PATH
       проверка целостности tamper-evident журнала: пересчитывает цепь хэшей
@@ -124,14 +127,20 @@ func cmdInit(args []string) {
 	if *adminOut == "" {
 		*adminOut = filepath.Join(*data, "admin.pem")
 	}
+	initNode(*data, *key, *adminOut, splitCSV(*ips), *noTLS)
+}
 
-	mk, err := loadOrCreateMaster(*key)
+// initNode performs first-time deployment: master key (on the USB flash),
+// encrypted vault, admin operator key, internal CA and the node TLS certificate.
+// It is invoked by `pp init` and, in wizard mode, by `pp run` when no vault exists yet.
+func initNode(data, key, adminOut string, ips []string, noTLS bool) {
+	mk, err := loadOrCreateMaster(key)
 	if err != nil {
 		log.Fatalf("init: master key: %v", err)
 	}
 	defer mk.Destroy()
 
-	st, err := db.Open(*data, mk.Bytes())
+	st, err := db.Open(data, mk.Bytes())
 	if err != nil {
 		log.Fatalf("init: db: %v", err)
 	}
@@ -147,13 +156,13 @@ func cmdInit(args []string) {
 		if err != nil {
 			log.Fatalf("init: admin: %v", err)
 		}
-		if err := os.MkdirAll(filepath.Dir(*adminOut), 0o700); err != nil {
+		if err := os.MkdirAll(filepath.Dir(adminOut), 0o700); err != nil {
 			log.Fatalf("init: admin-out dir: %v", err)
 		}
-		if err := os.WriteFile(*adminOut, []byte(res.PrivatePEM), 0o600); err != nil {
+		if err := os.WriteFile(adminOut, []byte(res.PrivatePEM), 0o600); err != nil {
 			log.Fatalf("init: admin-out write: %v", err)
 		}
-		fmt.Printf("admin key written to %s\n", *adminOut)
+		fmt.Printf("admin key written to %s\n", adminOut)
 	} else {
 		fmt.Println("admin key already exists, skipped")
 	}
@@ -161,16 +170,16 @@ func cmdInit(args []string) {
 	if err := st.Close(ctx); err != nil {
 		log.Fatalf("init: close: %v", err)
 	}
-	fmt.Printf("initialized: data=%q vault=%q master_key=%q\n", *data, filepath.Join(*data, "vault.db"), *key)
+	fmt.Printf("initialized: data=%q vault=%q master_key=%q\n", data, filepath.Join(data, "vault.db"), key)
 
-	if *noTLS {
+	if noTLS {
 		fmt.Println("tls: skipped (use 'pp run -tls' needs data/tls.crt + data/tls.key)")
 		return
 	}
-	certPath := filepath.Join(*data, "tls.crt")
-	keyPath := filepath.Join(*data, "tls.key")
-	caCertPath := filepath.Join(*data, "ca.crt")
-	caKeyPath := filepath.Join(*data, "ca.key")
+	certPath := filepath.Join(data, "tls.crt")
+	keyPath := filepath.Join(data, "tls.key")
+	caCertPath := filepath.Join(data, "ca.crt")
+	caKeyPath := filepath.Join(data, "ca.key")
 	if _, err := os.Stat(certPath); err == nil {
 		fmt.Println("tls: certificate already exists, skipped")
 		return
@@ -181,7 +190,7 @@ func cmdInit(args []string) {
 		}
 		fmt.Printf("tls: mesh CA written (%s, %s)\n", caCertPath, caKeyPath)
 	}
-	if err := crypto.WriteServerTLSCert(caCertPath, caKeyPath, certPath, keyPath, splitCSV(*ips), "ПАК АСК offline node"); err != nil {
+	if err := crypto.WriteServerTLSCert(caCertPath, caKeyPath, certPath, keyPath, ips, "ПАК АСК offline node"); err != nil {
 		log.Fatalf("init: tls: %v", err)
 	}
 	fmt.Printf("tls: node certificate written (%s, %s)\n", certPath, keyPath)
@@ -570,15 +579,64 @@ func cmdRun(args []string) {
 	tls := fs.Bool("tls", false, "serve HTTPS/WSS using <data>/tls.crt and <data>/tls.key")
 	parse(fs, args)
 
-	if *key == "" {
-		fmt.Fprintln(os.Stderr, "run: -key is required (path to the USB master key file)")
-		os.Exit(2)
-	}
-	if _, err := os.Stat(*key); err != nil {
-		log.Fatalf("run: master key not found at %s (run 'pp init -key %s' first)", *key, *key)
+	tlsSet := false
+	fs.Visit(func(f *flag.Flag) {
+		if f.Name == "tls" {
+			tlsSet = true
+		}
+	})
+
+	adminOut := filepath.Join(*data, "admin.pem")
+	vaultPath := filepath.Join(*data, "vault.db")
+	_, vaultErr := os.Stat(vaultPath)
+	vaultExists := vaultErr == nil
+
+	keyPath := *key
+	noKeyFlag := keyPath == ""
+	if noKeyFlag {
+		// Авторежим: мастер-ключ ищем на USB-носителях.
+		if !vaultExists {
+			p, err := pickUsbForNewKey()
+			if err != nil {
+				fmt.Fprintln(os.Stderr, "run:", err)
+				os.Exit(2)
+			}
+			keyPath = p
+		} else {
+			p, err := findExistingUsbKey()
+			if err != nil {
+				fmt.Fprintln(os.Stderr, "run:", err)
+				os.Exit(2)
+			}
+			keyPath = p
+		}
+		fmt.Printf("run: master key found on USB: %s\n", keyPath)
 	}
 
-	mk, err := crypto.LoadMasterKey(*key)
+	if !vaultExists {
+		// Мастер первого запуска: ключи на флешке, vault, админ, CA + TLS,
+		// SAN с автоопределённым LAN-IP — без единого флага.
+		ips := []string{}
+		if ip := firstLANIPv4(); ip != "" {
+			ips = append(ips, ip)
+		}
+		initNode(*data, keyPath, adminOut, ips, false)
+		scheme := "http"
+		if *tls {
+			scheme = "https"
+		}
+		printFirstRun(*data, *port, scheme, adminOut, ips)
+	} else if _, err := os.Stat(keyPath); err != nil {
+		log.Fatalf("run: master key not found at %s (run 'pp init -key %s' first)", keyPath, keyPath)
+	}
+
+	if noKeyFlag && !tlsSet {
+		// Авторежим — по умолчанию HTTPS (WebRTC нужно secure context).
+		*tls = true
+		log.Printf("http: -tls enabled automatically; укажите -tls=false для HTTP")
+	}
+
+	mk, err := crypto.LoadMasterKey(keyPath)
 	if err != nil {
 		log.Fatalf("run: master key: %v", err)
 	}

@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"crypto/sha256"
 	"os"
 	"path/filepath"
 	"strings"
@@ -13,35 +14,38 @@ import (
 func TestHalvesLifecycleFirstRunThenRestart(t *testing.T) {
 	data, usbs := setupUsbs(t, 2)
 
-	// first run: resolver picks a free stick, CreateHalves materializes the key
+	// first run: resolver picks a clean stick, CreateHalvesWithID binds the node
 	withConfirm(t, func(q string, opts []string) (int, error) {
 		if len(opts) != 2 {
 			t.Fatalf("expected both sticks as create candidates, got %v", opts)
 		}
 		return 1, nil // usb2
 	})
-	src, err := resolveKeySource("", data, false, true)
+	src, err := resolveKeySource("", data, false, true, "ТАНЖЕР")
 	if err != nil {
 		t.Fatalf("resolve (first run): %v", err)
 	}
 	if want := filepath.Join(usbs[1], usbKeyFileName); src.usbHalf != want {
 		t.Fatalf("expected usb half %s, got %s", want, src.usbHalf)
 	}
-	mk1, err := crypto.CreateHalves(src.localHalf, src.usbHalf)
+	if src.nodeName != "ТАНЖЕР" || src.nodeID == [16]byte{} {
+		t.Fatalf("resolver must assign node identity, got %q %x", src.nodeName, src.nodeID)
+	}
+	mk1, err := crypto.CreateHalvesWithID(src.localHalf, src.usbHalf, src.nodeID, src.nodeName)
 	if err != nil {
 		t.Fatal(err)
 	}
 	key1 := mk1.Bytes()
 	mk1.Destroy()
 
-	// restart: the only stick that carries the key is proposed and recombined
+	// restart: the only stick that carries THIS node's key is proposed
 	withConfirm(t, func(q string, opts []string) (int, error) {
 		if len(opts) != 1 || opts[0] != usbs[1] {
 			t.Fatalf("expected usb2 to be proposed for reuse, got %v", opts)
 		}
 		return 0, nil
 	})
-	src2, err := resolveKeySource("", data, true, false)
+	src2, err := resolveKeySource("", data, true, false, "")
 	if err != nil {
 		t.Fatalf("resolve (restart): %v", err)
 	}
@@ -77,7 +81,7 @@ func setupUsbs(t *testing.T, n int) (data string, usbs []string) {
 	return data, usbs
 }
 
-// confirmAuto makes the choice hook non-interactive (auto/headless path).
+// withConfirm makes the choice hook non-interactive.
 func withConfirm(t *testing.T, fn func(string, []string) (int, error)) {
 	t.Helper()
 	prev := confirmStick
@@ -85,9 +89,51 @@ func withConfirm(t *testing.T, fn func(string, []string) (int, error)) {
 	confirmStick = fn
 }
 
+// nodeIDFor derives a deterministic nodeID from a name so tests can pair.
+func nodeIDFor(name string) [16]byte {
+	sum := sha256.Sum256([]byte(name))
+	var id [16]byte
+	copy(id[:], sum[:16])
+	return id
+}
+
+// writeNode creates paired halves <data>/pp.local and <m>/pp.key for one node.
+func writeNode(t *testing.T, data, m, name string) {
+	t.Helper()
+	if _, err := crypto.CreateHalvesWithID(filepath.Join(data, localKeyFileName), filepath.Join(m, usbKeyFileName), nodeIDFor(name), name); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// foreignKeyOn puts ONLY a USB half of another node onto mount m (its local
+// half stays elsewhere).
+func foreignKeyOn(t *testing.T, m, name string) {
+	t.Helper()
+	dir := t.TempDir()
+	ud := filepath.Join(dir, "pp.key")
+	if _, err := crypto.CreateHalvesWithID(filepath.Join(dir, "pp.local"), ud, nodeIDFor(name), name); err != nil {
+		t.Fatal(err)
+	}
+	raw, err := os.ReadFile(ud)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(m, usbKeyFileName), raw, 0o600); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// legacyKey writes a raw 32-byte pp.key (pre-nodeID format).
+func legacyKey(t *testing.T, m string) {
+	t.Helper()
+	if err := os.WriteFile(filepath.Join(m, usbKeyFileName), make([]byte, 32), 0o600); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestResolveKeySourceExplicitKeyWins(t *testing.T) {
 	data, _ := setupUsbs(t, 0)
-	src, err := resolveKeySource("/abs/path/pp.key", data, true, false)
+	src, err := resolveKeySource("/abs/path/pp.key", data, true, false, "")
 	if err != nil {
 		t.Fatalf("resolve: %v", err)
 	}
@@ -97,18 +143,18 @@ func TestResolveKeySourceExplicitKeyWins(t *testing.T) {
 }
 
 func TestResolveKeySourceErrors(t *testing.T) {
-	t.Run("no media, vault present, first-run causes hint", func(t *testing.T) {
+	t.Run("no media, node deployed", func(t *testing.T) {
 		data, _ := setupUsbs(t, 0)
-		localHalf(t, data)
+		writeNode(t, data, t.TempDir(), "альфа")
 		withConfirm(t, func(string, []string) (int, error) { return 0, nil })
-		if _, err := resolveKeySource("", data, true, false); err == nil || !strings.Contains(err.Error(), "USB") {
+		if _, err := resolveKeySource("", data, true, false, ""); err == nil || !strings.Contains(err.Error(), "USB") {
 			t.Fatalf("expected a friendly USB error, got %v", err)
 		}
 	})
 	t.Run("no media at all on first run", func(t *testing.T) {
 		data, _ := setupUsbs(t, 0)
 		withConfirm(t, func(string, []string) (int, error) { return 0, nil })
-		if _, err := resolveKeySource("", data, false, true); err == nil || !strings.Contains(err.Error(), "USB") {
+		if _, err := resolveKeySource("", data, false, true, ""); err == nil || !strings.Contains(err.Error(), "USB") {
 			t.Fatalf("expected a friendly USB error, got %v", err)
 		}
 	})
@@ -116,43 +162,40 @@ func TestResolveKeySourceErrors(t *testing.T) {
 		data, usbs := setupUsbs(t, 1)
 		_ = usbs
 		withConfirm(t, func(string, []string) (int, error) { return 0, nil })
-		if _, err := resolveKeySource("", data, true, false); err == nil || !strings.Contains(err.Error(), "pp.local") {
+		if _, err := resolveKeySource("", data, true, false, ""); err == nil || !strings.Contains(err.Error(), "pp.local") {
 			t.Fatalf("expected a missing-local-half error, got %v", err)
+		}
+	})
+	t.Run("legacy local half", func(t *testing.T) {
+		data, _ := setupUsbs(t, 1)
+		if err := os.WriteFile(filepath.Join(data, localKeyFileName), make([]byte, 32), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := resolveKeySource("", data, true, false, ""); err == nil || !strings.Contains(err.Error(), "формат") {
+			t.Fatalf("expected a legacy-format error, got %v", err)
+		}
+	})
+	t.Run("foreign sticks only", func(t *testing.T) {
+		data, usbs := setupUsbs(t, 1)
+		writeNode(t, data, t.TempDir(), "альфа") // local half on data
+		foreignKeyOn(t, usbs[0], "бета")
+		if _, err := resolveKeySource("", data, true, false, ""); err == nil ||
+			!strings.Contains(err.Error(), "альфа") || !strings.Contains(err.Error(), "бета") {
+			t.Fatalf("expected an error naming both nodes, got %v", err)
 		}
 	})
 }
 
-func key(t *testing.T, m string) string {
-	t.Helper()
-	p := filepath.Join(m, usbKeyFileName)
-	if err := os.WriteFile(p, make([]byte, 32), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	return p
-}
-
-// localHalf writes the local half next to the data dir (present on an
-// already-initialized node).
-func localHalf(t *testing.T, data string) string {
-	t.Helper()
-	p := filepath.Join(data, localKeyFileName)
-	if err := os.WriteFile(p, make([]byte, 32), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	return p
-}
-
 func TestResolveKeySourceReusesUsbHalf(t *testing.T) {
 	data, usbs := setupUsbs(t, 2)
-	localHalf(t, data)
-	key(t, usbs[1])
+	writeNode(t, data, usbs[1], "альфа")
 	withConfirm(t, func(q string, opts []string) (int, error) {
 		if len(opts) != 1 || opts[0] != usbs[1] {
 			t.Fatalf("expected single stick %s to be proposed, got %v", usbs[1], opts)
 		}
 		return 0, nil
 	})
-	src, err := resolveKeySource("", data, true, false)
+	src, err := resolveKeySource("", data, true, false, "")
 	if err != nil {
 		t.Fatalf("resolve: %v", err)
 	}
@@ -164,46 +207,109 @@ func TestResolveKeySourceReusesUsbHalf(t *testing.T) {
 	}
 }
 
-func TestResolveKeySourceInteractivePick(t *testing.T) {
-	data, usbs := setupUsbs(t, 3)
-	localHalf(t, data)
-	key(t, usbs[0])
-	key(t, usbs[1])
-	key(t, usbs[2])
+func TestResolveKeySourceFiltersForeignStick(t *testing.T) {
+	data, usbs := setupUsbs(t, 2)
+	writeNode(t, data, usbs[0], "альфа")
+	foreignKeyOn(t, usbs[1], "бета")
 	withConfirm(t, func(q string, opts []string) (int, error) {
-		if len(opts) != 3 {
-			t.Fatalf("expected 3 sticks to be offered, got %v", opts)
+		if len(opts) != 1 || opts[0] != usbs[0] {
+			t.Fatalf("only the own stick must be offered, got %v", opts)
 		}
-		return 2, nil // picks the third
+		return 0, nil
 	})
-	src, err := resolveKeySource("", data, true, false)
+	src, err := resolveKeySource("", data, true, false, "")
 	if err != nil {
 		t.Fatalf("resolve: %v", err)
 	}
-	if want := filepath.Join(usbs[2], usbKeyFileName); src.usbHalf != want {
+	if want := filepath.Join(usbs[0], usbKeyFileName); src.usbHalf != want {
 		t.Fatalf("expected %s, got %s", want, src.usbHalf)
 	}
 }
 
-func TestResolveKeySourceFirstRunCreatesOnFreeStick(t *testing.T) {
-	data, usbs := setupUsbs(t, 2)
+func TestResolveKeySourceInteractivePick(t *testing.T) {
+	data, usbs := setupUsbs(t, 3)
+	writeNode(t, data, usbs[0], "альфа")
+	foreignKeyOn(t, usbs[1], "бета")
+	foreignKeyOn(t, usbs[2], "бета") // second copy of the foreign node
 	withConfirm(t, func(q string, opts []string) (int, error) {
-		if len(opts) != 2 {
-			t.Fatalf("expected both free sticks to be offered, got %v", opts)
+		if len(opts) != 1 || opts[0] != usbs[0] {
+			t.Fatalf("multiple foreign copies must not pollute the choice, got %v", opts)
 		}
-		return 1, nil // picks the second
+		return 0, nil
 	})
-	src, err := resolveKeySource("", data, false, true)
-	if err != nil {
+	if _, err := resolveKeySource("", data, true, false, ""); err != nil {
 		t.Fatalf("resolve: %v", err)
 	}
-	if want := filepath.Join(usbs[1], usbKeyFileName); src.usbHalf != want {
-		t.Fatalf("expected %s, got %s", want, src.usbHalf)
-	}
-	// no key file created yet — the caller (CreateHalves) creates it
-	if _, err := os.Stat(src.usbHalf); !os.IsNotExist(err) {
-		t.Fatal("USB half must not be created by the resolver alone")
-	}
+}
+
+func TestResolveKeySourceFirstRunCreateOk(t *testing.T) {
+	t.Run("clean sticks offered", func(t *testing.T) {
+		data, usbs := setupUsbs(t, 2)
+		withConfirm(t, func(q string, opts []string) (int, error) {
+			if len(opts) != 2 {
+				t.Fatalf("expected both free sticks to be offered, got %v", opts)
+			}
+			return 1, nil // picks the second
+		})
+		src, err := resolveKeySource("", data, false, true, "АЛЬФА")
+		if err != nil {
+			t.Fatalf("resolve: %v", err)
+		}
+		if want := filepath.Join(usbs[1], usbKeyFileName); src.usbHalf != want {
+			t.Fatalf("expected %s, got %s", want, src.usbHalf)
+		}
+		if src.nodeName != "АЛЬФА" || src.nodeID == [16]byte{} {
+			t.Fatalf("node identity must be assigned, got %q %x", src.nodeName, src.nodeID)
+		}
+		if _, err := os.Stat(src.usbHalf); !os.IsNotExist(err) {
+			t.Fatal("USB half must not be created by the resolver alone")
+		}
+	})
+	t.Run("autogen node name", func(t *testing.T) {
+		data, _ := setupUsbs(t, 1)
+		withConfirm(t, func(string, []string) (int, error) { return 0, nil })
+		src, err := resolveKeySource("", data, false, true, "")
+		if err != nil {
+			t.Fatalf("resolve: %v", err)
+		}
+		if !strings.HasPrefix(src.nodeName, "node-") {
+			t.Fatalf("expected autogenerated node-<hex> name, got %q", src.nodeName)
+		}
+	})
+	t.Run("busy stick skipped, clean stick offered", func(t *testing.T) {
+		data, usbs := setupUsbs(t, 2)
+		foreignKeyOn(t, usbs[0], "бета")
+		withConfirm(t, func(q string, opts []string) (int, error) {
+			if len(opts) != 1 || opts[0] != usbs[1] {
+				t.Fatalf("busy stick must not be offered, got %v", opts)
+			}
+			return 0, nil
+		})
+		src, err := resolveKeySource("", data, false, true, "")
+		if err != nil {
+			t.Fatalf("resolve: %v", err)
+		}
+		if want := filepath.Join(usbs[1], usbKeyFileName); src.usbHalf != want {
+			t.Fatalf("expected %s, got %s", want, src.usbHalf)
+		}
+	})
+	t.Run("all sticks busy -> hint to insert a clean one", func(t *testing.T) {
+		data, usbs := setupUsbs(t, 1)
+		foreignKeyOn(t, usbs[0], "бета")
+		withConfirm(t, func(string, []string) (int, error) { return 0, nil })
+		if _, err := resolveKeySource("", data, false, true, ""); err == nil ||
+			!strings.Contains(err.Error(), "чистую флешку") || !strings.Contains(err.Error(), "бета") {
+			t.Fatalf("expected 'insert a clean stick' error naming the foreign node, got %v", err)
+		}
+	})
+	t.Run("legacy stick is treated as busy", func(t *testing.T) {
+		data, usbs := setupUsbs(t, 1)
+		legacyKey(t, usbs[0])
+		withConfirm(t, func(string, []string) (int, error) { return 0, nil })
+		if _, err := resolveKeySource("", data, false, true, ""); err == nil {
+			t.Fatal("a legacy stick must not be overwritten at first run")
+		}
+	})
 }
 
 func TestDefaultConfirmStickHeadless(t *testing.T) {
@@ -217,16 +323,6 @@ func TestDefaultConfirmStickHeadless(t *testing.T) {
 	if _, err := defaultConfirmStick("q", []string{"/mnt/a", "/mnt/b"}); err == nil {
 		t.Fatal("several sticks in headless mode must require -key")
 	}
-}
-
-func TestMountsWithKey(t *testing.T) {
-	data, usbs := setupUsbs(t, 3)
-	key(t, usbs[1])
-	got := mountsWithKey()
-	if len(got) != 1 || got[0] != usbs[1] {
-		t.Fatalf("expected only usb2 to carry the key, got %v", got)
-	}
-	_ = data
 }
 
 func TestFirstLANIPv4ReturnsValidAddress(t *testing.T) {

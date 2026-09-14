@@ -66,26 +66,30 @@ func usage() {
 	fmt.Fprintf(os.Stderr, `privatephone ПАК АСК %s
 
 usage:
-  pp init [-data DIR] [-key PATH] [-rescue-out FILE] [-admin-out PATH] [-ips 192.168.1.10,..] [-no-tls]
+  pp init [-data DIR] [-key PATH] [-rescue-out FILE] [-admin-out PATH] [-ips 192.168.1.10,..] [-no-tls] [-node NAME]
       первичное развёртывание: создаёт составной мастер-ключ (локальная половина
       data/pp.local + USB-половина pp.key на флешке), базу, ключ администратора,
       внутренний CA (data/ca.crt) и TLS-сертификат узла от этого CA для HTTPS/WSS
       (IP — через -ips). Корень CA импортируется в доверенные один раз на все
       абонентские устройства; -no-tls пропускает генерацию сертификатов.
       Флешка — носитель ключа: сервер сам находит/предлагает её и просит
-      подтвердить выбор. -key PATH — явный полный ключ (резервный сценарий);
-      -rescue-out FILE сохраняет полный ключ в указанный файл (в сейф).
+      подтвердить выбор; конкурирующие флешки ДРУГИХ узлов не предлагаются и
+      перечисляются с их именами. -key PATH — явный полный ключ (резервный
+      сценарий); -rescue-out FILE сохраняет полный ключ в указанный файл (в сейф).
+      -node NAME — короткое имя узла («ТАНЖЕР»), пишется в обе половины и на
+      этикетку флешке; без него — автоген node-<hex>.
       По умолчанию -data — папка data РЯДОМ с бинарником (бинарник живёт в
       user-директории оператора, флешка несёт только половину ключа).
 
-  pp run [-port :8080] [-data DIR] [-key PATH] [-watch] [-persist 5s] [-tls]
+  pp run [-port :8080] [-data DIR] [-key PATH] [-watch] [-persist 5s] [-tls] [-node NAME]
       запуск узла связи. При извлечении USB-флешки — носителя ключа — процесс
       немедленно завершается, ключ из памяти затирается. -tls — слушать
       HTTPS/WSS (нужен WebRTC-звонкам и доступу по IP).
       Без -key — "мастер первого запуска": ключ собирается из половин
-      (data/pp.local + найденная флешка с pp.key, выбор подтверждается),
+      (data/pp.local + найденная флешка с pp.key того же узла, выбор подтверждается),
       при отсутствии данных node сам себя инициализирует (vault, админ, CA,
-      TLS) и стартует по https. -key — явный полный ключ (резервный режим).
+      TLS) и стартует по https. -node задаёт имя узла для первого запуска.
+      -key — явный полный ключ (резервный режим).
 
   pp verify-journal [-data DIR] [-key PATH]
       проверка целостности tamper-evident журнала: пересчитывает цепь хэшей
@@ -125,6 +129,7 @@ func cmdInit(args []string) {
 	data := fs.String("data", exeDataDir(), "data directory (default: <dir-of-this-binary>/data)")
 	key := fs.String("key", "", "full master key file (rescue/dev single-key mode; default: two halves — local + USB stick)")
 	rescueOut := fs.String("rescue-out", "", "write the combined full master key to FILE for safe-keeping")
+	node := fs.String("node", "", "short node name written into both halves and suggested for the stick label (default auto node-<hex>)")
 	adminOut := fs.String("admin-out", "", "file to write the admin private key (default <data>/admin.pem)")
 	ips := fs.String("ips", "", "comma-separated LAN IPs to embed into the TLS certificate (for https/wss access)")
 	noTLS := fs.Bool("no-tls", false, "skip generating the self-signed TLS certificate")
@@ -146,15 +151,15 @@ func cmdInit(args []string) {
 			log.Fatalf("init: master key: %v", err)
 		}
 	} else {
-		src, err := resolveKeySource(*key, *data, false, true)
+		src, err := resolveKeySource(*key, *data, false, true, *node)
 		if err != nil {
 			log.Fatalf("init: %v", err)
 		}
-		mk, err = crypto.CreateHalves(src.localHalf, src.usbHalf)
+		mk, err = crypto.CreateHalvesWithID(src.localHalf, src.usbHalf, src.nodeID, src.nodeName)
 		if err != nil {
 			log.Fatalf("init: master key halves: %v", err)
 		}
-		fmt.Printf("master key halves: local=%s usb=%s\n", src.localHalf, src.usbHalf)
+		fmt.Printf("master key halves: local=%s usb=%s (узел %q)\n", src.localHalf, src.usbHalf, src.nodeName)
 	}
 	defer mk.Destroy()
 
@@ -263,7 +268,7 @@ func loadKeyFor(data, keyFlag string) *crypto.MasterKey {
 		}
 		return mk
 	}
-	src, err := resolveKeySource(keyFlag, data, true, false)
+	src, err := resolveKeySource(keyFlag, data, true, false, "")
 	if err != nil {
 		log.Fatalf("master key: %v", err)
 	}
@@ -596,6 +601,7 @@ func cmdRun(args []string) {
 	port := fs.String("port", ":8080", "listen address")
 	data := fs.String("data", exeDataDir(), "data directory (default: <dir-of-this-binary>/data)")
 	key := fs.String("key", "", "full master key file (rescue/dev single-key mode; default: two halves — <data>/pp.local + USB stick)")
+	node := fs.String("node", "", "node name for first-run wizard (default auto node-<hex>)")
 	watch := fs.Bool("watch", true, "kill the process when the USB flash (key carrier) is removed")
 	persistEvery := fs.Duration("persist", 5*time.Second, "vault persist interval")
 	skew := fs.Duration("clock-skew", crypto.DefaultSkewWindow, "freshness window for packet timestamps")
@@ -629,17 +635,19 @@ func cmdRun(args []string) {
 	// сервер находит сам и просит подтвердить.
 	var mk *crypto.MasterKey
 	if noKeyFlag {
-		src, err := resolveKeySource(*key, *data, vaultExists, firstRun)
+		src, err := resolveKeySource(*key, *data, vaultExists, firstRun, *node)
 		if err != nil {
 			fmt.Fprintln(os.Stderr, "run:", err)
 			os.Exit(2)
 		}
 		if firstRun {
-			mk, err = crypto.CreateHalves(src.localHalf, src.usbHalf)
+			mk, err = crypto.CreateHalvesWithID(src.localHalf, src.usbHalf, src.nodeID, src.nodeName)
 			if err != nil {
 				log.Fatalf("run: master key halves: %v", err)
 			}
-			fmt.Printf("run: создан мастер-ключ: локальная половина %s + USB-половина %s\n", src.localHalf, src.usbHalf)
+			fmt.Printf("run: создан мастер-ключ: локальная половина %s + USB-половина %s (узел %q)\n",
+				src.localHalf, src.usbHalf, src.nodeName)
+			*node = src.nodeName
 		} else {
 			mk, err = crypto.KeyFromHalves(src.localHalf, src.usbHalf)
 			if err != nil {
@@ -673,7 +681,7 @@ func cmdRun(args []string) {
 		if *tls {
 			scheme = "https"
 		}
-		printFirstRun(*data, *port, scheme, adminOut, ips)
+		printFirstRun(*data, *port, scheme, adminOut, *node, ips)
 	}
 
 	defer mk.Destroy()

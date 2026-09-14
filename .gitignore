@@ -11,7 +11,8 @@ frontend/dist/
 # go
 server/bin/
 server/tmp/
-/server
+/server/server
+/server/server.exe
 
 # builds
 build/

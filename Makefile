@@ -8,6 +8,8 @@ DATA    := $(ROOT)/data
 MASTER_USB ?=
 # optional combined full key file to write during init (operator safe-keeping)
 RESCUE     ?=
+# optional short node name written into both halves and on the stick label
+NODE       ?=
 ADMIN      ?= $(DATA)/admin.pem
 PORT       ?= :8080
 # comma-separated LAN IPs embedded into the self-signed TLS cert SAN (any, e.g. "192.168.1.10")
@@ -53,7 +55,7 @@ cross: ui gentiles ## binaries for all PLATFORMS -> build/pp-<os>-<arch>[.exe]
 
 init: ## first-time deployment: two halves (local + USB stick) or -key rescue mode
 	mkdir -p "$(DATA)"
-	cd "$(ROOT)/server" && $(GO) run ./cmd/server init -data "$(DATA)" -admin-out "$(ADMIN)" $(if $(MASTER_USB),-key "$(MASTER_USB)",) $(if $(RESCUE),-rescue-out "$(RESCUE)",) $(if $(IPS),-ips "$(IPS)",)
+	cd "$(ROOT)/server" && $(GO) run ./cmd/server init -data "$(DATA)" -admin-out "$(ADMIN)" $(if $(MASTER_USB),-key "$(MASTER_USB)",) $(if $(RESCUE),-rescue-out "$(RESCUE)",) $(if $(IPS),-ips "$(IPS)",) $(if $(NODE),-node "$(NODE)",)
 	@echo
 	@echo "local half : $(DATA)/pp.local  (keep on the machine)"
 	@echo "USB half   : on the USB flash (pp.key) — не вынимайте флешку в работе"

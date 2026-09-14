@@ -1,146 +1,237 @@
 package main
 
 import (
+	"bytes"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"privatephone/server/internal/crypto"
 )
 
-func TestUsbKeyResolution(t *testing.T) {
-	dir := t.TempDir()
-	m1 := filepath.Join(dir, "usb1")
-	m2 := filepath.Join(dir, "usb2")
-	_ = os.MkdirAll(m1, 0o700)
-	_ = os.MkdirAll(m2, 0o700)
+func TestHalvesLifecycleFirstRunThenRestart(t *testing.T) {
+	data, usbs := setupUsbs(t, 2)
 
-	prev := removableMounts
-	defer func() { removableMounts = prev }()
-
-	t.Run("no mounts -> friendly error", func(t *testing.T) {
-		removableMounts = func() []string { return nil }
-		if _, err := pickUsbForNewKey(); err == nil || !strings.Contains(err.Error(), "USB") {
-			t.Fatalf("expected a friendly USB error, got %v", err)
+	// first run: resolver picks a free stick, CreateHalves materializes the key
+	withConfirm(t, func(q string, opts []string) (int, error) {
+		if len(opts) != 2 {
+			t.Fatalf("expected both sticks as create candidates, got %v", opts)
 		}
-		if _, err := findExistingUsbKey(); err == nil {
-			t.Fatal("expected error when no key exists")
-		}
+		return 1, nil // usb2
 	})
+	src, err := resolveKeySource("", data, false, true)
+	if err != nil {
+		t.Fatalf("resolve (first run): %v", err)
+	}
+	if want := filepath.Join(usbs[1], usbKeyFileName); src.usbHalf != want {
+		t.Fatalf("expected usb half %s, got %s", want, src.usbHalf)
+	}
+	mk1, err := crypto.CreateHalves(src.localHalf, src.usbHalf)
+	if err != nil {
+		t.Fatal(err)
+	}
+	key1 := mk1.Bytes()
+	mk1.Destroy()
 
-	t.Run("creates key on first free mount", func(t *testing.T) {
-		removableMounts = func() []string { return []string{m1, m2} }
-		p, err := pickUsbForNewKey()
-		if err != nil {
-			t.Fatalf("pick: %v", err)
+	// restart: the only stick that carries the key is proposed and recombined
+	withConfirm(t, func(q string, opts []string) (int, error) {
+		if len(opts) != 1 || opts[0] != usbs[1] {
+			t.Fatalf("expected usb2 to be proposed for reuse, got %v", opts)
 		}
-		if want := filepath.Join(m1, usbKeyFileName); p != want {
-			t.Fatalf("expected %s, got %s", want, p)
-		}
+		return 0, nil
 	})
+	src2, err := resolveKeySource("", data, true, false)
+	if err != nil {
+		t.Fatalf("resolve (restart): %v", err)
+	}
+	mk2, err := crypto.KeyFromHalves(src2.localHalf, src2.usbHalf)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer mk2.Destroy()
+	if !bytes.Equal(key1, mk2.Bytes()) {
+		t.Fatal("recombined key must match the one created on first run")
+	}
+}
 
-	t.Run("reuses existing key", func(t *testing.T) {
-		existing := filepath.Join(m2, usbKeyFileName)
-		if err := os.WriteFile(existing, []byte("k"), 0o600); err != nil {
+// withUsbs sets up a temp "media root" with n USB mounts and swaps
+// removableMounts/confirmStick for the duration of the test.
+func setupUsbs(t *testing.T, n int) (data string, usbs []string) {
+	t.Helper()
+	root := t.TempDir()
+	data = filepath.Join(root, "data")
+	if err := os.MkdirAll(data, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < n; i++ {
+		m := filepath.Join(root, "usb"+string(rune('1'+i)))
+		if err := os.MkdirAll(m, 0o700); err != nil {
 			t.Fatal(err)
 		}
-		removableMounts = func() []string { return []string{m1, m2} }
-		p, err := findExistingUsbKey()
-		if err != nil {
-			t.Fatalf("find: %v", err)
-		}
-		if p != existing {
-			t.Fatalf("expected %s, got %s", existing, p)
-		}
-		p2, err := pickUsbForNewKey()
-		if err != nil {
-			t.Fatalf("pick: %v", err)
-		}
-		if p2 != existing {
-			t.Fatalf("pick must reuse existing key, got %s", p2)
+		usbs = append(usbs, m)
+	}
+	prev := removableMounts
+	t.Cleanup(func() { removableMounts = prev })
+	removableMounts = func() []string { return usbs }
+	return data, usbs
+}
+
+// confirmAuto makes the choice hook non-interactive (auto/headless path).
+func withConfirm(t *testing.T, fn func(string, []string) (int, error)) {
+	t.Helper()
+	prev := confirmStick
+	t.Cleanup(func() { confirmStick = prev })
+	confirmStick = fn
+}
+
+func TestResolveKeySourceExplicitKeyWins(t *testing.T) {
+	data, _ := setupUsbs(t, 0)
+	src, err := resolveKeySource("/abs/path/pp.key", data, true, false)
+	if err != nil {
+		t.Fatalf("resolve: %v", err)
+	}
+	if src.explicit != "/abs/path/pp.key" {
+		t.Fatalf("explicit key must win, got %+v", src)
+	}
+}
+
+func TestResolveKeySourceErrors(t *testing.T) {
+	t.Run("no media, vault present, first-run causes hint", func(t *testing.T) {
+		data, _ := setupUsbs(t, 0)
+		localHalf(t, data)
+		withConfirm(t, func(string, []string) (int, error) { return 0, nil })
+		if _, err := resolveKeySource("", data, true, false); err == nil || !strings.Contains(err.Error(), "USB") {
+			t.Fatalf("expected a friendly USB error, got %v", err)
 		}
 	})
-
-	t.Run("firstLANIPv4 returns a syntactically valid address", func(t *testing.T) {
-		ip := firstLANIPv4()
-		if ip != "" {
-			if !strings.Contains(ip, ".") {
-				t.Fatalf("unexpected IP format: %q", ip)
-			}
+	t.Run("no media at all on first run", func(t *testing.T) {
+		data, _ := setupUsbs(t, 0)
+		withConfirm(t, func(string, []string) (int, error) { return 0, nil })
+		if _, err := resolveKeySource("", data, false, true); err == nil || !strings.Contains(err.Error(), "USB") {
+			t.Fatalf("expected a friendly USB error, got %v", err)
+		}
+	})
+	t.Run("local half missing and not first run", func(t *testing.T) {
+		data, usbs := setupUsbs(t, 1)
+		_ = usbs
+		withConfirm(t, func(string, []string) (int, error) { return 0, nil })
+		if _, err := resolveKeySource("", data, true, false); err == nil || !strings.Contains(err.Error(), "pp.local") {
+			t.Fatalf("expected a missing-local-half error, got %v", err)
 		}
 	})
 }
 
-func TestResolveRunKey(t *testing.T) {
-	data := filepath.Join(t.TempDir(), "data")
-	if err := os.MkdirAll(data, 0o700); err != nil {
+func key(t *testing.T, m string) string {
+	t.Helper()
+	p := filepath.Join(m, usbKeyFileName)
+	if err := os.WriteFile(p, make([]byte, 32), 0o600); err != nil {
 		t.Fatal(err)
 	}
+	return p
+}
 
-	t.Run("explicit -key wins", func(t *testing.T) {
-		p, err := resolveRunKey(data, "/abs/path/usb/pp.key", true)
-		if err != nil {
-			t.Fatalf("resolve: %v", err)
+// localHalf writes the local half next to the data dir (present on an
+// already-initialized node).
+func localHalf(t *testing.T, data string) string {
+	t.Helper()
+	p := filepath.Join(data, localKeyFileName)
+	if err := os.WriteFile(p, make([]byte, 32), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return p
+}
+
+func TestResolveKeySourceReusesUsbHalf(t *testing.T) {
+	data, usbs := setupUsbs(t, 2)
+	localHalf(t, data)
+	key(t, usbs[1])
+	withConfirm(t, func(q string, opts []string) (int, error) {
+		if len(opts) != 1 || opts[0] != usbs[1] {
+			t.Fatalf("expected single stick %s to be proposed, got %v", usbs[1], opts)
 		}
-		if p != "/abs/path/usb/pp.key" {
-			t.Fatalf("expected explicit key, got %s", p)
-		}
+		return 0, nil
 	})
+	src, err := resolveKeySource("", data, true, false)
+	if err != nil {
+		t.Fatalf("resolve: %v", err)
+	}
+	if want := filepath.Join(usbs[1], usbKeyFileName); src.usbHalf != want {
+		t.Fatalf("expected %s, got %s", want, src.usbHalf)
+	}
+	if src.localHalf != filepath.Join(data, localKeyFileName) {
+		t.Fatalf("unexpected local half: %s", src.localHalf)
+	}
+}
 
-	t.Run("first run: local key next to data", func(t *testing.T) {
-		p, err := resolveRunKey(data, "", false)
-		if err != nil {
-			t.Fatalf("resolve: %v", err)
+func TestResolveKeySourceInteractivePick(t *testing.T) {
+	data, usbs := setupUsbs(t, 3)
+	localHalf(t, data)
+	key(t, usbs[0])
+	key(t, usbs[1])
+	key(t, usbs[2])
+	withConfirm(t, func(q string, opts []string) (int, error) {
+		if len(opts) != 3 {
+			t.Fatalf("expected 3 sticks to be offered, got %v", opts)
 		}
-		if want := filepath.Join(data, usbKeyFileName); p != want {
-			t.Fatalf("expected %s, got %s", want, p)
-		}
+		return 2, nil // picks the third
 	})
+	src, err := resolveKeySource("", data, true, false)
+	if err != nil {
+		t.Fatalf("resolve: %v", err)
+	}
+	if want := filepath.Join(usbs[2], usbKeyFileName); src.usbHalf != want {
+		t.Fatalf("expected %s, got %s", want, src.usbHalf)
+	}
+}
 
-	t.Run("reuses local key next to data", func(t *testing.T) {
-		local := filepath.Join(data, usbKeyFileName)
-		if err := os.WriteFile(local, []byte("k"), 0o600); err != nil {
-			t.Fatal(err)
+func TestResolveKeySourceFirstRunCreatesOnFreeStick(t *testing.T) {
+	data, usbs := setupUsbs(t, 2)
+	withConfirm(t, func(q string, opts []string) (int, error) {
+		if len(opts) != 2 {
+			t.Fatalf("expected both free sticks to be offered, got %v", opts)
 		}
-		p, err := resolveRunKey(data, "", true)
-		if err != nil {
-			t.Fatalf("resolve: %v", err)
-		}
-		if p != local {
-			t.Fatalf("expected %s, got %s", local, p)
-		}
+		return 1, nil // picks the second
 	})
+	src, err := resolveKeySource("", data, false, true)
+	if err != nil {
+		t.Fatalf("resolve: %v", err)
+	}
+	if want := filepath.Join(usbs[1], usbKeyFileName); src.usbHalf != want {
+		t.Fatalf("expected %s, got %s", want, src.usbHalf)
+	}
+	// no key file created yet — the caller (CreateHalves) creates it
+	if _, err := os.Stat(src.usbHalf); !os.IsNotExist(err) {
+		t.Fatal("USB half must not be created by the resolver alone")
+	}
+}
 
-	t.Run("no local key, vault present -> USB fallback", func(t *testing.T) {
-		if err := os.Remove(filepath.Join(data, usbKeyFileName)); err != nil {
-			t.Fatal(err)
-		}
-		usb := filepath.Join(t.TempDir(), "usb")
-		if err := os.MkdirAll(usb, 0o700); err != nil {
-			t.Fatal(err)
-		}
-		existing := filepath.Join(usb, usbKeyFileName)
-		if err := os.WriteFile(existing, []byte("k"), 0o600); err != nil {
-			t.Fatal(err)
-		}
-		prev := removableMounts
-		defer func() { removableMounts = prev }()
-		removableMounts = func() []string { return []string{usb} }
+func TestDefaultConfirmStickHeadless(t *testing.T) {
+	prev := stdinIsTTY
+	t.Cleanup(func() { stdinIsTTY = prev })
+	stdinIsTTY = func() bool { return false }
 
-		p, err := resolveRunKey(data, "", true)
-		if err != nil {
-			t.Fatalf("resolve: %v", err)
-		}
-		if p != existing {
-			t.Fatalf("expected %s, got %s", existing, p)
-		}
-	})
+	if i, err := defaultConfirmStick("q", []string{"/mnt/usb"}); err != nil || i != 0 {
+		t.Fatalf("single stick must auto-select, got %d err %v", i, err)
+	}
+	if _, err := defaultConfirmStick("q", []string{"/mnt/a", "/mnt/b"}); err == nil {
+		t.Fatal("several sticks in headless mode must require -key")
+	}
+}
 
-	t.Run("no local key, no media -> friendly error", func(t *testing.T) {
-		prev := removableMounts
-		defer func() { removableMounts = prev }()
-		removableMounts = func() []string { return nil }
-		if _, err := resolveRunKey(data, "", true); err == nil {
-			t.Fatal("expected a friendly error")
-		}
-	})
+func TestMountsWithKey(t *testing.T) {
+	data, usbs := setupUsbs(t, 3)
+	key(t, usbs[1])
+	got := mountsWithKey()
+	if len(got) != 1 || got[0] != usbs[1] {
+		t.Fatalf("expected only usb2 to carry the key, got %v", got)
+	}
+	_ = data
+}
+
+func TestFirstLANIPv4ReturnsValidAddress(t *testing.T) {
+	ip := firstLANIPv4()
+	if ip == "" || !strings.Contains(ip, ".") {
+		t.Fatalf("unexpected IP: %q", ip)
+	}
 }

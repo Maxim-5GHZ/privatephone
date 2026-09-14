@@ -86,6 +86,112 @@ func TestMasterKeyWatchFiresOnUnlink(t *testing.T) {
 	}
 }
 
+func TestCreateHalvesRoundtripAndPerms(t *testing.T) {
+	local := filepath.Join(t.TempDir(), "data", "pp.local")
+	usb := filepath.Join(t.TempDir(), "usb", "pp.key")
+
+	mk, err := CreateHalves(local, usb)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer mk.Destroy()
+	first := mk.Bytes()
+
+	if mk.Path() != usb {
+		t.Fatalf("Watch target must be the USB half, got %s", mk.Path())
+	}
+	for _, p := range []string{local, usb} {
+		fi, err := os.Stat(p)
+		if err != nil {
+			t.Fatalf("half not written: %v", err)
+		}
+		if fi.Size() != 32 {
+			t.Fatalf("half %s size %d, want 32", p, fi.Size())
+		}
+		if fi.Mode().Perm() != 0o600 {
+			t.Fatalf("half %s perms %v, want 0600", p, fi.Mode().Perm())
+		}
+	}
+
+	recombined, err := KeyFromHalves(local, usb)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer recombined.Destroy()
+	if !bytes.Equal(first, recombined.Bytes()) {
+		t.Fatal("recombining persisted halves must yield the same key")
+	}
+
+	usbCopy := filepath.Join(t.TempDir(), "pp.key")
+	if err := os.MkdirAll(filepath.Dir(usbCopy), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	raw, err := os.ReadFile(usb)
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw[0] ^= 0xff
+	if err := os.WriteFile(usbCopy, raw, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	withBadHalf, err := KeyFromHalves(local, usbCopy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer withBadHalf.Destroy()
+	if bytes.Equal(first, withBadHalf.Bytes()) {
+		t.Fatal("changing one half must change the combined key")
+	}
+}
+
+func TestKeyFromHalvesErrors(t *testing.T) {
+	dir := t.TempDir()
+	if _, err := KeyFromHalves(filepath.Join(dir, "missing-local"), filepath.Join(dir, "missing-usb")); err == nil {
+		t.Fatal("missing halves must not recombine")
+	}
+	short := filepath.Join(dir, "short")
+	if err := os.WriteFile(short, []byte("not-32-bytes"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	ok := filepath.Join(dir, "ok")
+	if err := os.WriteFile(ok, bytes.Repeat([]byte{0x41}, 32), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := KeyFromHalves(short, ok); err == nil {
+		t.Fatal("wrong-size half must be rejected")
+	}
+	if _, err := KeyFromHalves(ok, short); err == nil {
+		t.Fatal("wrong-size USB half must be rejected")
+	}
+}
+
+func TestCreateHalvesWatchFiresOnUsbRemoval(t *testing.T) {
+	local := filepath.Join(t.TempDir(), "pp.local")
+	usb := filepath.Join(t.TempDir(), "usb", "pp.key")
+	mk, err := CreateHalves(local, usb)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer mk.Destroy()
+
+	loss := make(chan struct{})
+	mk.Watch(10*time.Millisecond, func() { close(loss) })
+	if err := os.Remove(usb); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-loss:
+	case <-time.After(3 * time.Second):
+		t.Fatal("Watch must fire when the USB half is removed")
+	}
+	if !allZero(mk.Bytes()) {
+		t.Fatal("combined key must be zeroed on USB half loss")
+	}
+	if !mk.dead {
+		t.Fatal("combined key must be marked dead on USB half loss")
+	}
+}
+
 func allZero(b []byte) bool {
 	for _, v := range b {
 		if v != 0 {

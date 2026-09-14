@@ -66,42 +66,49 @@ func usage() {
 	fmt.Fprintf(os.Stderr, `privatephone ПАК АСК %s
 
 usage:
-  pp init [-key PATH] [-data DIR] [-admin-out PATH] [-ips 192.168.1.10,..] [-no-tls]
-      первичное развёртывание: создаёт мастер-ключ, базу, ключ администратора,
+  pp init [-data DIR] [-key PATH] [-rescue-out FILE] [-admin-out PATH] [-ips 192.168.1.10,..] [-no-tls]
+      первичное развёртывание: создаёт составной мастер-ключ (локальная половина
+      data/pp.local + USB-половина pp.key на флешке), базу, ключ администратора,
       внутренний CA (data/ca.crt) и TLS-сертификат узла от этого CA для HTTPS/WSS
       (IP — через -ips). Корень CA импортируется в доверенные один раз на все
       абонентские устройства; -no-tls пропускает генерацию сертификатов.
-      Портативный режим: по умолчанию -data — папка data РЯДОМ с самим бинарником
-      (явная флешка: бинарник, ключ и база лежат вместе), -key — <data>/pp.key
-      там же.
+      Флешка — носитель ключа: сервер сам находит/предлагает её и просит
+      подтвердить выбор. -key PATH — явный полный ключ (резервный сценарий);
+      -rescue-out FILE сохраняет полный ключ в указанный файл (в сейф).
+      По умолчанию -data — папка data РЯДОМ с бинарником (бинарник живёт в
+      user-директории оператора, флешка несёт только половину ключа).
 
-  pp run [-port :8080] [-data DIR] [-key PATH] [(-watch|--no-watch)] [-persist 5s] [-tls]
-      запуск узла связи. При извлечении носителя процесс немедленно завершается.
-      -tls — слушать HTTPS/WSS (нужен WebRTC-звонкам и доступу по IP).
-      Без -key — "мастер первого запуска": ключ ищется (создаётся) в <data>/pp.key
-      рядом с бинарником, при отсутствии данных node сам себя инициализирует
-      (vault, админ, CA, TLS) и стартует по https.
+  pp run [-port :8080] [-data DIR] [-key PATH] [-watch] [-persist 5s] [-tls]
+      запуск узла связи. При извлечении USB-флешки — носителя ключа — процесс
+      немедленно завершается, ключ из памяти затирается. -tls — слушать
+      HTTPS/WSS (нужен WebRTC-звонкам и доступу по IP).
+      Без -key — "мастер первого запуска": ключ собирается из половин
+      (data/pp.local + найденная флешка с pp.key, выбор подтверждается),
+      при отсутствии данных node сам себя инициализирует (vault, админ, CA,
+      TLS) и стартует по https. -key — явный полный ключ (резервный режим).
 
-  pp verify-journal [-data DIR] -key PATH
+  pp verify-journal [-data DIR] [-key PATH]
       проверка целостности tamper-evident журнала: пересчитывает цепь хэшей
       и сообщает первый повреждённый пакет (exit 1 при повреждении).
+      -key — полный ключ (резервный режим); без него ключ собирается из половин.
 
-  pp journal-export [-data DIR] -key PATH [-after TS] [-out FILE]
+  pp journal-export [-data DIR] [-key PATH] [-after TS] [-out FILE]
       выгрузка журнала узла в «мешок» для sneaker-net-переноса (stdout, если -out '-').
       -after TS — только пакеты с ts >= TS (инкрементальный перенос).
 
-  pp journal-import [-data DIR] -key PATH -in FILE
+  pp journal-import [-data DIR] [-key PATH] -in FILE
       импорт мешка на узел: проверяет подписи по локальному реестру абонентов,
       цепь хэшей и непрерывность с локальным журналом, затем воспроизводит
       события (метки, сообщения, тревоги, зоны, отзывы). Повторный импорт идемпотентен.
 
-  pp vault-backup [-data DIR] -key PATH -out FILE
+  pp vault-backup [-data DIR] [-key PATH] -out FILE
       упаковка зашифрованного vault.db (+ tls.crt/tls.key и admin.pem, если есть)
       в tar.gz-архив. Узел должен быть остановлен.
 
-  pp vault-restore -in FILE [-data DIR] -key PATH [-force]
+  pp vault-restore -in FILE [-data DIR] [-key PATH] [-force]
       распаковка архива в data, открытие vault мастер-ключом и проверка журнала.
       Отказывается перезаписывать существующий vault.db без -force.
+      Восстановление на «чистую» машину требует -key (или переноса data/pp.local).
 
   pp version
 `, version)
@@ -115,32 +122,57 @@ func parse(fs *flag.FlagSet, args []string) {
 
 func cmdInit(args []string) {
 	fs := flag.NewFlagSet("init", flag.ExitOnError)
-	data := fs.String("data", exeDataDir(), "data directory (default: <dir-of-this-binary>/data — portable mode)")
-	key := fs.String("key", "", "master key file (default <data>/pp.key next to the binary)")
+	data := fs.String("data", exeDataDir(), "data directory (default: <dir-of-this-binary>/data)")
+	key := fs.String("key", "", "full master key file (rescue/dev single-key mode; default: two halves — local + USB stick)")
+	rescueOut := fs.String("rescue-out", "", "write the combined full master key to FILE for safe-keeping")
 	adminOut := fs.String("admin-out", "", "file to write the admin private key (default <data>/admin.pem)")
 	ips := fs.String("ips", "", "comma-separated LAN IPs to embed into the TLS certificate (for https/wss access)")
 	noTLS := fs.Bool("no-tls", false, "skip generating the self-signed TLS certificate")
 	parse(fs, args)
 
-	if *key == "" {
-		*key = filepath.Join(*data, usbKeyFileName)
-	}
 	if *adminOut == "" {
 		*adminOut = filepath.Join(*data, "admin.pem")
 	}
-	initNode(*data, *key, *adminOut, splitCSV(*ips), *noTLS)
-}
+	vaultPath := filepath.Join(*data, "vault.db")
+	if _, err := os.Stat(vaultPath); err == nil {
+		log.Fatalf("init: %s already exists — узел уже развёрнут (удалите %s, чтобы переустановить)", vaultPath, *data)
+	}
 
-// initNode performs first-time deployment: master key (on the USB flash),
-// encrypted vault, admin operator key, internal CA and the node TLS certificate.
-// It is invoked by `pp init` and, in wizard mode, by `pp run` when no vault exists yet.
-func initNode(data, key, adminOut string, ips []string, noTLS bool) {
-	mk, err := loadOrCreateMaster(key)
-	if err != nil {
-		log.Fatalf("init: master key: %v", err)
+	var mk *crypto.MasterKey
+	if *key != "" {
+		var err error
+		mk, err = loadOrCreateMaster(*key)
+		if err != nil {
+			log.Fatalf("init: master key: %v", err)
+		}
+	} else {
+		src, err := resolveKeySource(*key, *data, false, true)
+		if err != nil {
+			log.Fatalf("init: %v", err)
+		}
+		mk, err = crypto.CreateHalves(src.localHalf, src.usbHalf)
+		if err != nil {
+			log.Fatalf("init: master key halves: %v", err)
+		}
+		fmt.Printf("master key halves: local=%s usb=%s\n", src.localHalf, src.usbHalf)
 	}
 	defer mk.Destroy()
 
+	if *rescueOut != "" {
+		if err := os.WriteFile(*rescueOut, mk.Bytes(), 0o600); err != nil {
+			log.Fatalf("init: rescue-out write: %v", err)
+		}
+		fmt.Printf("rescue master key written to %s (храните в сейфе, отдельно от флешки)\n", *rescueOut)
+	}
+
+	initNode(*data, *adminOut, mk, splitCSV(*ips), *noTLS)
+}
+
+// initNode performs first-time deployment: the (already resolved) master key,
+// encrypted vault, admin operator key, internal CA and the node TLS
+// certificate. It is invoked by `pp init` and, in wizard mode, by `pp run`
+// when no vault exists yet.
+func initNode(data, adminOut string, mk *crypto.MasterKey, ips []string, noTLS bool) {
 	st, err := db.Open(data, mk.Bytes())
 	if err != nil {
 		log.Fatalf("init: db: %v", err)
@@ -171,7 +203,7 @@ func initNode(data, key, adminOut string, ips []string, noTLS bool) {
 	if err := st.Close(ctx); err != nil {
 		log.Fatalf("init: close: %v", err)
 	}
-	fmt.Printf("initialized: data=%q vault=%q master_key=%q\n", data, filepath.Join(data, "vault.db"), key)
+	fmt.Printf("initialized: data=%q vault=%q master_key=halves(local+USB)\n", data, filepath.Join(data, "vault.db"))
 
 	if noTLS {
 		fmt.Println("tls: skipped (use 'pp run -tls' needs data/tls.crt + data/tls.key)")
@@ -220,19 +252,34 @@ func loadOrCreateMaster(path string) (*crypto.MasterKey, error) {
 	return mk, nil
 }
 
+// loadKeyFor opens the vault master key for maintenance subcommands: a full
+// single key file when -key is given (rescue/dev mode), otherwise the two
+// halves — the local half in the data dir plus a confirmed USB half.
+func loadKeyFor(data, keyFlag string) *crypto.MasterKey {
+	if keyFlag != "" {
+		mk, err := crypto.LoadMasterKey(keyFlag)
+		if err != nil {
+			log.Fatalf("master key: %v", err)
+		}
+		return mk
+	}
+	src, err := resolveKeySource(keyFlag, data, true, false)
+	if err != nil {
+		log.Fatalf("master key: %v", err)
+	}
+	mk, err := crypto.KeyFromHalves(src.localHalf, src.usbHalf)
+	if err != nil {
+		log.Fatalf("master key halves: %v", err)
+	}
+	return mk
+}
+
 func cmdVerifyJournal(args []string) {
 	fs := flag.NewFlagSet("verify-journal", flag.ExitOnError)
-	key := fs.String("key", "", "master key file on the USB flash (required)")
+	key := fs.String("key", "", "full master key file (rescue mode); default: two halves — <data>/pp.local + USB stick")
 	data := fs.String("data", "./data", "data directory")
 	parse(fs, args)
-	if *key == "" {
-		fmt.Fprintln(os.Stderr, "verify-journal: -key is required")
-		os.Exit(2)
-	}
-	mk, err := crypto.LoadMasterKey(*key)
-	if err != nil {
-		log.Fatalf("verify-journal: master key: %v", err)
-	}
+	mk := loadKeyFor(*data, *key)
 	ctx := context.Background()
 	st, err := db.Open(*data, mk.Bytes())
 	if err != nil {
@@ -258,19 +305,12 @@ func cmdVerifyJournal(args []string) {
 
 func cmdJournalExport(args []string) {
 	fs := flag.NewFlagSet("journal-export", flag.ExitOnError)
-	key := fs.String("key", "", "master key file on the USB flash (required)")
+	key := fs.String("key", "", "full master key file (rescue mode); default: two halves — <data>/pp.local + USB stick")
 	data := fs.String("data", "./data", "data directory")
 	after := fs.Int64("after", 0, "export only packets with ts >= AFTER")
 	out := fs.String("out", "-", "output file ('-' = stdout)")
 	parse(fs, args)
-	if *key == "" {
-		fmt.Fprintln(os.Stderr, "journal-export: -key is required")
-		os.Exit(2)
-	}
-	mk, err := crypto.LoadMasterKey(*key)
-	if err != nil {
-		log.Fatalf("journal-export: master key: %v", err)
-	}
+	mk := loadKeyFor(*data, *key)
 	ctx := context.Background()
 	st, err := db.Open(*data, mk.Bytes())
 	if err != nil {
@@ -311,14 +351,10 @@ func cmdJournalExport(args []string) {
 
 func cmdJournalImport(args []string) {
 	fs := flag.NewFlagSet("journal-import", flag.ExitOnError)
-	key := fs.String("key", "", "master key file on the USB flash (required)")
+	key := fs.String("key", "", "full master key file (rescue mode); default: two halves — <data>/pp.local + USB stick")
 	data := fs.String("data", "./data", "data directory")
 	in := fs.String("in", "", "bag file ('-' = stdin, required)")
 	parse(fs, args)
-	if *key == "" {
-		fmt.Fprintln(os.Stderr, "journal-import: -key is required")
-		os.Exit(2)
-	}
 	if *in == "" {
 		fmt.Fprintln(os.Stderr, "journal-import: -in bag file is required")
 		os.Exit(2)
@@ -344,10 +380,7 @@ func cmdJournalImport(args []string) {
 		}
 	}
 
-	mk, err := crypto.LoadMasterKey(*key)
-	if err != nil {
-		log.Fatalf("journal-import: master key: %v", err)
-	}
+	mk := loadKeyFor(*data, *key)
 	ctx := context.Background()
 	st, err := db.Open(*data, mk.Bytes())
 	if err != nil {
@@ -378,23 +411,16 @@ func cmdJournalImport(args []string) {
 
 func cmdVaultBackup(args []string) {
 	fs := flag.NewFlagSet("vault-backup", flag.ExitOnError)
-	key := fs.String("key", "", "master key file on the USB flash (required)")
+	key := fs.String("key", "", "full master key file (rescue mode); default: two halves — <data>/pp.local + USB stick")
 	data := fs.String("data", "./data", "data directory")
 	out := fs.String("out", "", "backup archive path (required)")
 	parse(fs, args)
-	if *key == "" {
-		fmt.Fprintln(os.Stderr, "vault-backup: -key is required")
-		os.Exit(2)
-	}
 	if *out == "" {
 		fmt.Fprintln(os.Stderr, "vault-backup: -out archive path is required")
 		os.Exit(2)
 	}
 
-	mk, err := crypto.LoadMasterKey(*key)
-	if err != nil {
-		log.Fatalf("vault-backup: master key: %v", err)
-	}
+	mk := loadKeyFor(*data, *key)
 	// Opening with the master key proves the vault decrypts and flushes a
 	// consistent sealed snapshot before the archive is built.
 	st, err := db.Open(*data, mk.Bytes())
@@ -463,22 +489,19 @@ func cmdVaultBackup(args []string) {
 func cmdVaultRestore(args []string) {
 	fs := flag.NewFlagSet("vault-restore", flag.ExitOnError)
 	in := fs.String("in", "", "backup archive path (required)")
-	key := fs.String("key", "", "master key file on the USB flash (required)")
+	key := fs.String("key", "", "full master key file (rescue mode); default: two halves — <data>/pp.local + USB stick")
 	data := fs.String("data", "./data", "data directory")
 	force := fs.Bool("force", false, "overwrite an existing vault.db")
 	parse(fs, args)
-	if *in == "" || *key == "" {
-		fmt.Fprintln(os.Stderr, "vault-restore: -in and -key are required")
+	if *in == "" {
+		fmt.Fprintln(os.Stderr, "vault-restore: -in is required")
 		os.Exit(2)
 	}
 	vaultPath := filepath.Join(*data, "vault.db")
 	if _, err := os.Stat(vaultPath); err == nil && !*force {
 		log.Fatalf("vault-restore: %s already exists; use -force to replace it (back it up first)", vaultPath)
 	}
-	mk, err := crypto.LoadMasterKey(*key)
-	if err != nil {
-		log.Fatalf("vault-restore: master key: %v", err)
-	}
+	mk := loadKeyFor(*data, *key)
 	if err := os.MkdirAll(*data, 0o700); err != nil {
 		mk.Destroy()
 		log.Fatalf("vault-restore: data dir: %v", err)
@@ -571,9 +594,9 @@ func writeTarFile(tw *tar.Writer, name, path string, fi os.FileInfo) error {
 func cmdRun(args []string) {
 	fs := flag.NewFlagSet("run", flag.ExitOnError)
 	port := fs.String("port", ":8080", "listen address")
-	data := fs.String("data", exeDataDir(), "data directory (default: <dir-of-this-binary>/data — portable mode)")
-	key := fs.String("key", "", "master key file (default <data>/pp.key next to the binary)")
-	watch := fs.Bool("watch", true, "kill the process when the USB flash is removed")
+	data := fs.String("data", exeDataDir(), "data directory (default: <dir-of-this-binary>/data)")
+	key := fs.String("key", "", "full master key file (rescue/dev single-key mode; default: two halves — <data>/pp.local + USB stick)")
+	watch := fs.Bool("watch", true, "kill the process when the USB flash (key carrier) is removed")
 	persistEvery := fs.Duration("persist", 5*time.Second, "vault persist interval")
 	skew := fs.Duration("clock-skew", crypto.DefaultSkewWindow, "freshness window for packet timestamps")
 	calibrate := fs.Bool("clock-calibrate", false, "track the clock offset from admin packets")
@@ -591,25 +614,9 @@ func cmdRun(args []string) {
 	vaultPath := filepath.Join(*data, "vault.db")
 	_, vaultErr := os.Stat(vaultPath)
 	vaultExists := vaultErr == nil
+	firstRun := !vaultExists
 
-	keyPath := *key
-	noKeyFlag := keyPath == ""
-	if noKeyFlag {
-		// Авторежим: ключ рядом с данными (<data>/pp.key, портативная «флешка
-		// сервера»), при его отсутствии — запасной поиск на съёмных носителях.
-		var err error
-		keyPath, err = resolveRunKey(*data, *key, vaultExists)
-		if err != nil {
-			fmt.Fprintln(os.Stderr, "run:", err)
-			os.Exit(2)
-		}
-		if !vaultExists {
-			fmt.Printf("run: мастер-ключ будет создан рядом с данными: %s\n", keyPath)
-		} else {
-			fmt.Printf("run: мастер-ключ: %s\n", keyPath)
-		}
-	}
-
+	noKeyFlag := *key == ""
 	if noKeyFlag && !tlsSet {
 		// Авторежим — по умолчанию HTTPS (WebRTC нужно secure context) и
 		// инструкции первого запуска должны показать верный адрес https://.
@@ -617,27 +624,59 @@ func cmdRun(args []string) {
 		log.Printf("http: -tls enabled automatically; укажите -tls=false для HTTP")
 	}
 
-	if !vaultExists {
-		// Мастер первого запуска: ключи на флешке, vault, админ, CA + TLS,
-		// SAN с автоопределённым LAN-IP — без единого флага.
+	// Ключ: либо явный полный файл (-key, резервный режим), либо две половины
+	// — локальная <data>/pp.local и USB-половина pp.key с флешки, которую
+	// сервер находит сам и просит подтвердить.
+	var mk *crypto.MasterKey
+	if noKeyFlag {
+		src, err := resolveKeySource(*key, *data, vaultExists, firstRun)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "run:", err)
+			os.Exit(2)
+		}
+		if firstRun {
+			mk, err = crypto.CreateHalves(src.localHalf, src.usbHalf)
+			if err != nil {
+				log.Fatalf("run: master key halves: %v", err)
+			}
+			fmt.Printf("run: создан мастер-ключ: локальная половина %s + USB-половина %s\n", src.localHalf, src.usbHalf)
+		} else {
+			mk, err = crypto.KeyFromHalves(src.localHalf, src.usbHalf)
+			if err != nil {
+				log.Fatalf("run: master key halves: %v", err)
+			}
+			fmt.Printf("run: мастер-ключ из половин: %s + %s\n", src.localHalf, src.usbHalf)
+		}
+	} else if firstRun {
+		var err error
+		mk, err = loadOrCreateMaster(*key)
+		if err != nil {
+			log.Fatalf("run: master key: %v", err)
+		}
+	} else {
+		var err error
+		mk, err = crypto.LoadMasterKey(*key)
+		if err != nil {
+			log.Fatalf("run: master key: %v", err)
+		}
+	}
+
+	if firstRun {
+		// Мастер первого запуска: vault, админ, CA + TLS, SAN с
+		// автоопределённым LAN-IP — без единого флага.
 		ips := []string{}
 		if ip := firstLANIPv4(); ip != "" {
 			ips = append(ips, ip)
 		}
-		initNode(*data, keyPath, adminOut, ips, false)
+		initNode(*data, adminOut, mk, ips, false)
 		scheme := "http"
 		if *tls {
 			scheme = "https"
 		}
 		printFirstRun(*data, *port, scheme, adminOut, ips)
-	} else if _, err := os.Stat(keyPath); err != nil {
-		log.Fatalf("run: master key not found at %s (run 'pp init -key %s' first)", keyPath, keyPath)
 	}
 
-	mk, err := crypto.LoadMasterKey(keyPath)
-	if err != nil {
-		log.Fatalf("run: master key: %v", err)
-	}
+	defer mk.Destroy()
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()

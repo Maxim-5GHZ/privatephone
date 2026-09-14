@@ -1,20 +1,27 @@
 package main
 
 import (
+	"bufio"
 	"fmt"
 	"net"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 )
 
-// usbKeyFileName is the master-key file name looked for on removable media.
+// usbKeyFileName is the USB half of the master key, looked for on removable
+// media (the "USB stick as a key carrier" model).
 const usbKeyFileName = "pp.key"
 
-// exeDataDir returns <dir-of-the-binary>/data — the portable "server on a
-// flash" default. Because the data directory (and everything in it) lives
-// next to the binary, launching the binary straight off a USB stick works
-// regardless of the current working directory.
+// localKeyFileName is the local half of the master key, kept next to the data
+// on the operator's machine. Neither half alone unlocks the vault.
+const localKeyFileName = "pp.local"
+
+// exeDataDir returns <dir-of-the-binary>/data — the default node data
+// directory. Deploying the binary into a dedicated user folder (e.g.
+// ~/privatephone/pp) keeps the data, the local key half and the ciphertext
+// together, regardless of the current working directory.
 func exeDataDir() string {
 	exe, err := os.Executable()
 	if err != nil {
@@ -26,58 +33,123 @@ func exeDataDir() string {
 // removableMounts is swappable so tests can simulate USB media deterministically.
 var removableMounts = defaultRemovableMounts
 
-// findExistingUsbKey returns the path of an existing master key found on a
-// removable USB device, or a friendly error telling the operator to mount one.
-func findExistingUsbKey() (string, error) {
+// mountsWithKey returns removable mounts that already carry a USB half (pp.key).
+func mountsWithKey() []string {
+	var out []string
 	for _, m := range removableMounts() {
-		p := filepath.Join(m, usbKeyFileName)
-		if fi, err := os.Stat(p); err == nil && fi.Mode().IsRegular() {
-			return p, nil
+		if fi, err := os.Stat(filepath.Join(m, usbKeyFileName)); err == nil && fi.Mode().IsRegular() {
+			out = append(out, m)
 		}
 	}
-	return "", fmt.Errorf("на USB-носителях не найден файл %q: вставьте и смонтируйте флешку с мастер-ключом (или укажите -key <путь>)", usbKeyFileName)
+	return out
 }
 
-// pickUsbForNewKey returns a path on a removable USB device where a fresh
-// master key can be created. Reuses an existing key when present.
-func pickUsbForNewKey() (string, error) {
-	if p, err := findExistingUsbKey(); err == nil {
-		return p, nil
-	}
-	mounts := removableMounts()
-	if len(mounts) == 0 {
-		return "", fmt.Errorf("не обнаружено USB-носителей: вставьте флешку и смонтируйте её (или укажите -key <путь>)")
-	}
-	for _, m := range mounts {
-		p := filepath.Join(m, usbKeyFileName)
-		if _, err := os.Stat(p); os.IsNotExist(err) {
-			return p, nil
+// confirmStick presents removable mounts to the operator and returns the chosen
+// index. Swappable in tests; the default implementation is interactive on a
+// terminal and fallback-auto elsewhere.
+var confirmStick = defaultConfirmStick
+
+// defaultConfirmStick asks the operator to pick a removable medium (interactive
+// terminal mode). Headless (stdin is not a TTY): a single candidate is selected
+// automatically with a warning; several candidates produce an error and the
+// operator must pass -key explicitly.
+func defaultConfirmStick(q string, opts []string) (int, error) {
+	if !stdinIsTTY() {
+		if len(opts) == 1 {
+			fmt.Fprintf(os.Stderr, "носитель выбран автоматически (stdin не терминал): %s\n", opts[0])
+			return 0, nil
 		}
+		return -1, fmt.Errorf("обнаружено несколько USB-носителей; запустите в терминале для выбора или укажите -key <файл>")
 	}
-	return filepath.Join(mounts[0], usbKeyFileName), nil
+	r := bufio.NewReader(os.Stdin)
+	if len(opts) == 1 {
+		fmt.Printf("%s %s [Y/n] ", q, opts[0])
+		s, err := r.ReadString('\n')
+		if err != nil {
+			return -1, err
+		}
+		switch strings.ToLower(strings.TrimSpace(s)) {
+		case "", "y", "д":
+			return 0, nil
+		case "n", "н":
+			return -1, fmt.Errorf("отменено оператором")
+		}
+		return 0, nil
+	}
+	fmt.Println(q)
+	for i, m := range opts {
+		fmt.Printf("  %d) %s\n", i+1, m)
+	}
+	fmt.Printf("выберите носитель [1-%d, Enter=1]: ", len(opts))
+	s, err := r.ReadString('\n')
+	if err != nil {
+		return -1, err
+	}
+	if s = strings.TrimSpace(s); s == "" {
+		return 0, nil
+	}
+	n, err := strconv.Atoi(s)
+	if err != nil || n < 1 || n > len(opts) {
+		return -1, fmt.Errorf("некорректный номер носителя")
+	}
+	return n - 1, nil
 }
 
-// resolveRunKey picks the master-key path for `pp run` in auto (no -key) mode:
+// stdinIsTTY reports whether the operator console is interactive. Swappable in
+// tests so headless-mode behavior is testable deterministically.
+var stdinIsTTY = func() bool {
+	fi, err := os.Stdin.Stat()
+	return err == nil && fi.Mode()&os.ModeCharDevice != 0
+}
+
+// keySource describes where the master key lives for a node run.
+type keySource struct {
+	explicit  string // full single-file key (-key), non-empty in rescue/dev mode
+	localHalf string // <data>/pp.local
+	usbHalf   string // <usb>/pp.key, empty in explicit mode
+}
+
+// resolveKeySource picks where the master key lives:
 //
-//  1. an explicit -key flag always wins;
-//  2. <data>/pp.key next to the binary (portable "server on a flash"): reuse
-//     it if it exists; on first run (no vault yet) it is where the fresh key
-//     will be created;
-//  3. a vault exists but there is no local key — legacy fallback: search
-//     removable USB media;
-//  4. otherwise a friendly error telling the operator what to plug in.
-func resolveRunKey(data, keyFlag string, vaultExists bool) (string, error) {
+//  1. an explicit -key always wins (single full-key file, rescue/dev mode);
+//  2. otherwise the two-halves mode: <data>/pp.local + a USB half <usb>/pp.key.
+//     Existing USB halves are offered for confirmation (auto-picked headless
+//     with a single stick). When createOk is true and no stick carries a key
+//     yet, the operator picks a mount where a fresh USB half will be created.
+func resolveKeySource(keyFlag, data string, vaultExists, createOk bool) (keySource, error) {
 	if keyFlag != "" {
-		return keyFlag, nil
+		return keySource{explicit: keyFlag}, nil
 	}
-	local := filepath.Join(data, usbKeyFileName)
-	if _, err := os.Stat(local); err == nil {
-		return local, nil
+	src := keySource{localHalf: filepath.Join(data, localKeyFileName)}
+	if _, err := os.Stat(src.localHalf); err != nil {
+		if !createOk {
+			return src, fmt.Errorf("нет локальной половины мастер-ключа %q (создаётся при первом запуске; либо укажите -key)", src.localHalf)
+		}
 	}
-	if !vaultExists {
-		return local, nil
+
+	stickers := mountsWithKey()
+	switch {
+	case len(stickers) > 0:
+		i, err := confirmStick("Использовать мастер-ключ на USB-носителе:", stickers)
+		if err != nil {
+			return src, err
+		}
+		src.usbHalf = filepath.Join(stickers[i], usbKeyFileName)
+		return src, nil
+	case createOk:
+		usbs := removableMounts()
+		if len(usbs) == 0 {
+			return src, fmt.Errorf("не обнаружено USB-носителей: вставьте и смонтируйте флешку (или укажите -key <путь>)")
+		}
+		i, err := confirmStick("Создать USB-половину мастер-ключа на носителе:", usbs)
+		if err != nil {
+			return src, err
+		}
+		src.usbHalf = filepath.Join(usbs[i], usbKeyFileName)
+		return src, nil
+	default:
+		return src, fmt.Errorf("на USB-носителях не найден ключ %q: вставьте флешку с ключом (или укажите -key <путь>)", usbKeyFileName)
 	}
-	return findExistingUsbKey()
 }
 
 // firstLANIPv4 returns the first up, non-loopback, non-link-local IPv4
@@ -129,7 +201,11 @@ func printFirstRun(data, port, scheme, adminOut string, ips []string) {
 	fmt.Printf("     %s/ca.crt  (Linux: sudo scripts/install_ca.sh %s/ca.crt; Windows: Import-Certificate)\n", data, data)
 	fmt.Printf("     и открывать %s  — без импорта будет предупреждение браузера.\n", addr)
 	fmt.Println()
-	fmt.Println("Мастер-ключ базы хранится ТОЛЬКО на USB-флешке. Не вынимайте флешку")
-	fmt.Println("во время работы: при извлечении сервер затрёт ключ и завершится.")
+	fmt.Printf("Мастер-ключ базы составной из двух половин:\n")
+	fmt.Printf("  локальная половина: %s  (на диске машины)\n", filepath.Join(data, localKeyFileName))
+	fmt.Println("  USB-половина       на флешке (pp.key)")
+	fmt.Println("Не вынимайте флешку во время работы: при извлечении сервер затрёт ключ")
+	fmt.Println("из памяти и завершится. Потеря флешки ИЛИ локальной половины делает базу")
+	fmt.Println("неоткрываемой — храните их раздельно и держите резервный полный ключ в сейфе.")
 	fmt.Println()
 }

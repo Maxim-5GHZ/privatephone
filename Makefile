@@ -3,21 +3,21 @@ NPM     := npm
 ROOT    := $(CURDIR)
 BUILD   := $(ROOT)/build
 DATA    := $(ROOT)/data
-# path to the USB master key (or dev file)
-MASTER_USB ?= $(DATA)/pp.key
+# optional full rescue key path (-key): when set, init/run use single-key mode
+# instead of the default two-halves flow (local half + USB stick)
+MASTER_USB ?=
+# optional combined full key file to write during init (operator safe-keeping)
+RESCUE     ?=
 ADMIN      ?= $(DATA)/admin.pem
 PORT       ?= :8080
 # comma-separated LAN IPs embedded into the self-signed TLS cert SAN (any, e.g. "192.168.1.10")
 IPS        ?=
-# flash folder target: pick a platform via FLASH_OS/FLASH_ARCH (or OS/ARCH aliases)
-FLASH_OS   ?= $(OS)
-FLASH_ARCH ?= $(ARCH)
 
 PLATFORMS := linux/amd64 linux/arm64 windows/amd64 darwin/arm64
 
 .DEFAULT_GOAL := all
 
-.PHONY: help all ui gentiles build run dev init tiles test vet cover cross flash clean
+.PHONY: help all ui gentiles build run dev init tiles test vet cover cross clean
 
 help: ## list targets
 	@grep -E '^[a-zA-Z_-]+:.*?## ' $(MAKEFILE_LIST) | awk 'BEGIN{FS=":.*?## "} {printf "  %-12s %s\n", $$1, $$2}'
@@ -65,16 +65,17 @@ flash: ## stage a ready-to-copy flash folder: binary + operator memo -> build/fl
 
 ## --- Deploy / run ------------------------------------------------------------
 
-init: ## create master key on the USB device + admin key for the operator
+init: ## first-time deployment: two halves (local + USB stick) or -key rescue mode
 	mkdir -p "$(DATA)"
-	cd "$(ROOT)/server" && $(GO) run ./cmd/server init -key "$(MASTER_USB)" -data "$(DATA)" -admin-out "$(ADMIN)" $(if $(IPS),-ips "$(IPS)",)
+	cd "$(ROOT)/server" && $(GO) run ./cmd/server init -data "$(DATA)" -admin-out "$(ADMIN)" $(if $(MASTER_USB),-key "$(MASTER_USB)",) $(if $(RESCUE),-rescue-out "$(RESCUE)",) $(if $(IPS),-ips "$(IPS)",)
 	@echo
-	@echo "master key : $(MASTER_USB)  (keep on the USB flash, remove after copy)"
+	@echo "local half : $(DATA)/pp.local  (keep on the machine)"
+	@echo "USB half   : on the USB flash (pp.key) — не вынимайте флешку в работе"
 	@echo "admin key  : $(ADMIN)"
 	@echo "TLS cert   : $(DATA)/tls.crt  (import into every client once, WebRTC needs HTTPS)"
 
 run: ## run the server (binary must be already built with `make build`)
-	"$(BUILD)/pp" run -port "$(PORT)" -data "$(DATA)" -key "$(MASTER_USB)" -tls
+	"$(BUILD)/pp" run -port "$(PORT)" -data "$(DATA)" $(if $(MASTER_USB),-key "$(MASTER_USB)",) -tls
 
 dev: ## dev loop: Go server on :8080 + Vite on :5173 (no Docker)
 	"$(ROOT)/scripts/dev.sh"

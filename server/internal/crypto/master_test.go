@@ -4,8 +4,10 @@ import (
 	"bytes"
 	"crypto/tls"
 	"crypto/x509"
+	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -89,8 +91,12 @@ func TestMasterKeyWatchFiresOnUnlink(t *testing.T) {
 func TestCreateHalvesRoundtripAndPerms(t *testing.T) {
 	local := filepath.Join(t.TempDir(), "data", "pp.local")
 	usb := filepath.Join(t.TempDir(), "usb", "pp.key")
+	var nodeID [16]byte
+	for i := range nodeID {
+		nodeID[i] = byte(i + 1)
+	}
 
-	mk, err := CreateHalves(local, usb)
+	mk, err := CreateHalvesWithID(local, usb, nodeID, "ТАНЖЕР")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -105,12 +111,27 @@ func TestCreateHalvesRoundtripAndPerms(t *testing.T) {
 		if err != nil {
 			t.Fatalf("half not written: %v", err)
 		}
-		if fi.Size() != 32 {
-			t.Fatalf("half %s size %d, want 32", p, fi.Size())
+		if fi.Size() <= 32 {
+			t.Fatalf("half %s size %d, want header+32", p, fi.Size())
 		}
 		if fi.Mode().Perm() != 0o600 {
 			t.Fatalf("half %s perms %v, want 0600", p, fi.Mode().Perm())
 		}
+	}
+
+	li, err := ReadHalfHeader(local)
+	if err != nil {
+		t.Fatalf("local header: %v", err)
+	}
+	ui, err := ReadHalfHeader(usb)
+	if err != nil {
+		t.Fatalf("usb header: %v", err)
+	}
+	if li.NodeID != nodeID || ui.NodeID != nodeID || li.NodeID != ui.NodeID {
+		t.Fatalf("halves must carry the same nodeID: local=%x usb=%x", li.NodeID, ui.NodeID)
+	}
+	if li.Name != "ТАНЖЕР" || ui.Name != "ТАНЖЕР" {
+		t.Fatalf("name roundtrip failed: %q %q", li.Name, ui.Name)
 	}
 
 	recombined, err := KeyFromHalves(local, usb)
@@ -122,6 +143,8 @@ func TestCreateHalvesRoundtripAndPerms(t *testing.T) {
 		t.Fatal("recombining persisted halves must yield the same key")
 	}
 
+	// flipping a byte inside the raw half region (after the header) must change
+	// the combined key while keeping the format valid.
 	usbCopy := filepath.Join(t.TempDir(), "pp.key")
 	if err := os.MkdirAll(filepath.Dir(usbCopy), 0o700); err != nil {
 		t.Fatal(err)
@@ -130,7 +153,7 @@ func TestCreateHalvesRoundtripAndPerms(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	raw[0] ^= 0xff
+	raw[halfHeaderLen+int(raw[halfNameLenOffs])] ^= 0xff
 	if err := os.WriteFile(usbCopy, raw, 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -144,24 +167,117 @@ func TestCreateHalvesRoundtripAndPerms(t *testing.T) {
 	}
 }
 
-func TestKeyFromHalvesErrors(t *testing.T) {
+func TestKeyFromHalvesFormatErrors(t *testing.T) {
 	dir := t.TempDir()
-	if _, err := KeyFromHalves(filepath.Join(dir, "missing-local"), filepath.Join(dir, "missing-usb")); err == nil {
-		t.Fatal("missing halves must not recombine")
+	local := filepath.Join(dir, "pp.local")
+	usb := filepath.Join(dir, "pp.key")
+	var id [16]byte
+	if _, err := CreateHalvesWithID(local, usb, id, "alpha"); err != nil {
+		t.Fatal(err)
 	}
+
+	// missing file -> generic read error
+	if _, err := KeyFromHalves(filepath.Join(dir, "missing"), usb); err == nil {
+		t.Fatal("missing local half must not recombine")
+	}
+	// raw legacy 32-byte file -> clear legacy error
+	legacy := filepath.Join(dir, "legacy")
+	if err := os.WriteFile(legacy, bytes.Repeat([]byte{0x41}, masterKeySize), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := KeyFromHalves(legacy, usb); !errors.Is(err, ErrHalfLegacy) {
+		t.Fatalf("legacy raw half must yield ErrHalfLegacy, got %v", err)
+	}
+	// short/garbage file -> corrupt error
 	short := filepath.Join(dir, "short")
 	if err := os.WriteFile(short, []byte("not-32-bytes"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	ok := filepath.Join(dir, "ok")
-	if err := os.WriteFile(ok, bytes.Repeat([]byte{0x41}, 32), 0o600); err != nil {
+	if _, err := KeyFromHalves(short, usb); !errors.Is(err, ErrHalfCorrupt) {
+		t.Fatalf("short half must yield ErrHalfCorrupt, got %v", err)
+	}
+	// bad format version -> corrupt error
+	v2 := filepath.Join(dir, "v2")
+	var id2 [16]byte
+	if err := os.WriteFile(v2, encodeHalf(id2, "beta", make([]byte, masterKeySize)), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := KeyFromHalves(short, ok); err == nil {
-		t.Fatal("wrong-size half must be rejected")
+	b, _ := os.ReadFile(v2)
+	b[halfVerOffset] = 9
+	_ = os.WriteFile(v2, b, 0o600)
+	if _, err := KeyFromHalves(local, v2); !errors.Is(err, ErrHalfCorrupt) {
+		t.Fatalf("unknown version must yield ErrHalfCorrupt, got %v", err)
 	}
-	if _, err := KeyFromHalves(ok, short); err == nil {
-		t.Fatal("wrong-size USB half must be rejected")
+	// truncated name (length says 10, file shorter) -> corrupt error
+	trunc := filepath.Join(dir, "trunc")
+	var id3 [16]byte
+	tb := encodeHalf(id3, "beta", make([]byte, masterKeySize))
+	tb = tb[:len(tb)-5]
+	_ = os.WriteFile(trunc, tb, 0o600)
+	if _, err := KeyFromHalves(trunc, usb); !errors.Is(err, ErrHalfCorrupt) {
+		t.Fatalf("truncated half must yield ErrHalfCorrupt, got %v", err)
+	}
+}
+
+func TestKeyFromHalvesRejectsForeignHalf(t *testing.T) {
+	dir := t.TempDir()
+	d1 := filepath.Join(dir, "n1")
+	d2 := filepath.Join(dir, "n2")
+	for _, d := range []string{d1, d2} {
+		if err := os.MkdirAll(d, 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	var idA, idB [16]byte
+	idB[0] = 1
+	if _, err := CreateHalvesWithID(filepath.Join(d1, "pp.local"), filepath.Join(d1, "pp.key"), idA, "осло"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := CreateHalvesWithID(filepath.Join(d2, "pp.local"), filepath.Join(d2, "pp.key"), idB, "танжер"); err != nil {
+		t.Fatal(err)
+	}
+	_, err := KeyFromHalves(filepath.Join(d1, "pp.local"), filepath.Join(d2, "pp.key"))
+	if err == nil {
+		t.Fatal("combining halves of different nodes must be rejected")
+	}
+	if !strings.Contains(err.Error(), "танжер") || !strings.Contains(err.Error(), "осло") {
+		t.Fatalf("error must name the involved nodes, got %v", err)
+	}
+}
+
+func TestHalfNameValidation(t *testing.T) {
+	dir := t.TempDir()
+	var id [16]byte
+	for _, bad := range []string{"with\nnewline", "with\rreturn", "with\x00null", "контроль\x1b"} {
+		_, err := CreateHalvesWithID(filepath.Join(dir, "l"), filepath.Join(dir, "u"), id, bad)
+		if err == nil {
+			t.Fatalf("name %q must be rejected", bad)
+		}
+	}
+	long := string(bytes.Repeat([]byte{'x'}, halfNameMax+1))
+	if _, err := CreateHalvesWithID(filepath.Join(dir, "l2"), filepath.Join(dir, "u2"), id, long); err == nil {
+		t.Fatal("over-long name must be rejected")
+	}
+	if _, err := CreateHalvesWithID(filepath.Join(dir, "l3"), filepath.Join(dir, "u3"), id, "ок"); err != nil {
+		t.Fatalf("valid name must be accepted: %v", err)
+	}
+}
+
+func TestCreateHalvesAutogenNodeID(t *testing.T) {
+	dir := t.TempDir()
+	local := filepath.Join(dir, "pp.local")
+	usb := filepath.Join(dir, "pp.key")
+	mk, err := CreateHalves(local, usb)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mk.Destroy()
+	li, err := ReadHalfHeader(local)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if allZero(li.NodeID[:]) {
+		t.Fatal("autogen nodeID must not be all zeros")
 	}
 }
 

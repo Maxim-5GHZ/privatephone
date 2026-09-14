@@ -49,20 +49,6 @@ cross: ui gentiles ## binaries for all PLATFORMS -> build/pp-<os>-<arch>[.exe]
 	done
 	@ls -lh "$(BUILD)"/pp-*
 
-flash: ## stage a ready-to-copy flash folder: binary + operator memo -> build/flash
-	@os=$(or $(FLASH_OS),$(shell $(GO) env GOOS)); \
-	arch=$(or $(FLASH_ARCH),$(shell $(GO) env GOARCH)); \
-	ext=; [ "$$os" = "windows" ] && ext=".exe"; \
-	src="$(BUILD)/pp-$$os-$$arch$$ext"; \
-	if [ ! -f "$$src" ] && [ "$$os$$arch" = "$(shell $(GO) env GOOS)$(shell $(GO) env GOARCH)" ]; then src="$(BUILD)/pp"; fi; \
-	if [ ! -f "$$src" ]; then echo "error: $$src not found (run: make cross first)"; exit 1; fi; \
-	rm -rf "$(BUILD)/flash"; mkdir -p "$(BUILD)/flash"; \
-	cp "$$src" "$(BUILD)/flash/pp$$ext"; \
-	[ "$$os" != "windows" ] && chmod +x "$(BUILD)/flash/pp$$ext"; \
-	cp "$(ROOT)/scripts/README-FLASH.txt" "$(BUILD)/flash/"; \
-	echo "--- build/flash ---"; \
-	ls -lh "$(BUILD)/flash"
-
 ## --- Deploy / run ------------------------------------------------------------
 
 init: ## first-time deployment: two halves (local + USB stick) or -key rescue mode

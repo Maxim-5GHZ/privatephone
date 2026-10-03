@@ -70,6 +70,45 @@ function randNonce(): string {
   return b64(b)
 }
 
+// rawToDer converts a WebCrypto ECDSA signature (raw r||s, 64 bytes for
+// P-256) to ASN.1-DER, which is what the Go server verifies with
+// ecdsa.VerifyASN1. WebCrypto returns IEEE P1363, Go expects DER — sending
+// raw bytes is why every packet was rejected with "invalid signature".
+export function rawToDer(raw: Uint8Array): Uint8Array {
+  const trim = (b: Uint8Array): Uint8Array => {
+    let i = 0
+    while (i < b.length - 1 && b[i] === 0) i++
+    return b.slice(i)
+  }
+  let r = trim(raw.slice(0, 32))
+  let s = trim(raw.slice(32, 64))
+  if (r[0] & 0x80) {
+    const nr = new Uint8Array(r.length + 1)
+    nr[0] = 0
+    nr.set(r, 1)
+    r = nr
+  }
+  if (s[0] & 0x80) {
+    const ns = new Uint8Array(s.length + 1)
+    ns[0] = 0
+    ns.set(s, 1)
+    s = ns
+  }
+  const total = 2 + r.length + 2 + s.length
+  const out = new Uint8Array(2 + total)
+  let o = 0
+  out[o++] = 0x30
+  out[o++] = total
+  out[o++] = 0x02
+  out[o++] = r.length
+  out.set(r, o)
+  o += r.length
+  out[o++] = 0x02
+  out[o++] = s.length
+  out.set(s, o)
+  return out
+}
+
 export interface SignedPacket {
   headers: Record<string, string>
   body: string
@@ -92,7 +131,10 @@ export async function signPacket(kind: string, data: unknown): Promise<SignedPac
     signingKey,
     new TextEncoder().encode(canonical),
   )
-  const signature = b64(new Uint8Array(sigBuf))
+  const raw = new Uint8Array(sigBuf)
+  // WebCrypto gives 64-byte P1363; server expects DER (see rawToDer).
+  const der = raw.length === 64 ? rawToDer(raw) : raw
+  const signature = b64(der)
   return {
     headers: {
       'X-Sender': callsign,

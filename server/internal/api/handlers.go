@@ -6,12 +6,29 @@ import (
 	"fmt"
 	"net/http"
 	"strconv"
+	"strings"
 
 	"privatephone/server/internal/ca"
 	"privatephone/server/internal/db"
 	"privatephone/server/internal/protocol"
 	"privatephone/server/internal/ws"
 )
+
+// normalizeCallsign приводит позывной к канону UI: trim + lowercase.
+// Возвращает "" если позывной пустой, слишком длинный или содержит
+// пробелы/управляющие символы.
+func normalizeCallsign(s string) string {
+	c := strings.TrimSpace(strings.ToLower(s))
+	if c == "" || len(c) > 32 {
+		return ""
+	}
+	for _, r := range c {
+		if r <= 32 || r == 127 {
+			return ""
+		}
+	}
+	return c
+}
 
 func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 	if err := s.st.Ping(r.Context()); err != nil {
@@ -26,6 +43,9 @@ func (s *Server) handleListSubscribers(w http.ResponseWriter, r *http.Request, e
 	if err != nil {
 		writeErr(w, http.StatusInternalServerError, "list subscribers")
 		return
+	}
+	if subs == nil {
+		subs = []db.Subscriber{}
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"subscribers": subs})
 }
@@ -51,8 +71,27 @@ func (s *Server) handleSnapshot(w http.ResponseWriter, r *http.Request, ev *prot
 		writeErr(w, http.StatusInternalServerError, "zones")
 		return
 	}
+	chats, err := s.st.ListChatsFor(r.Context(), ev.Sender)
+	if err != nil {
+		chats = nil
+	}
+	if markers == nil {
+		markers = []db.Marker{}
+	}
+	if messages == nil {
+		messages = []db.Message{}
+	}
+	if alerts == nil {
+		alerts = []db.Alert{}
+	}
+	if zones == nil {
+		zones = []db.Zone{}
+	}
+	if chats == nil {
+		chats = []db.Chat{}
+	}
 	writeJSON(w, http.StatusOK, ws.Snapshot{
-		Markers: markers, Messages: messages, Alerts: alerts, Zones: zones, Online: s.hub.Online(),
+		Markers: markers, Messages: messages, Alerts: alerts, Zones: zones, Chats: chats, Online: s.hub.Online(),
 	})
 }
 
@@ -64,6 +103,9 @@ func (s *Server) handlePending(w http.ResponseWriter, r *http.Request, ev *proto
 	if err != nil {
 		writeErr(w, http.StatusInternalServerError, "pending")
 		return
+	}
+	if pkts == nil {
+		pkts = []db.Packet{}
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"items": pkts})
 }
@@ -175,6 +217,13 @@ func (s *Server) handleCreateSubscriber(w http.ResponseWriter, r *http.Request, 
 		writeErr(w, http.StatusBadRequest, "callsign required")
 		return
 	}
+	// Нормализация как в UI (Login/Admin): trim + lowercase, чтобы "Bob" и
+	// "bob" не заводили два разных абонента.
+	callsign := normalizeCallsign(req.Callsign)
+	if callsign == "" {
+		writeErr(w, http.StatusBadRequest, "bad callsign (1..32 chars, no spaces)")
+		return
+	}
 	if req.Role == "" {
 		req.Role = "operator"
 	}
@@ -182,7 +231,7 @@ func (s *Server) handleCreateSubscriber(w http.ResponseWriter, r *http.Request, 
 		writeErr(w, http.StatusBadRequest, "role must be operator or admin")
 		return
 	}
-	res, err := ca.Create(r.Context(), s.st, req.Callsign, req.Role)
+	res, err := ca.Create(r.Context(), s.st, callsign, req.Role)
 	if err != nil {
 		if errors.Is(err, db.ErrDuplicate) {
 			writeErr(w, http.StatusConflict, "callsign already registered")
@@ -261,6 +310,9 @@ func (s *Server) handleJournalExport(w http.ResponseWriter, r *http.Request, ev 
 		writeErr(w, http.StatusInternalServerError, "journal head")
 		return
 	}
+	if entries == nil {
+		entries = []db.JournalEntry{}
+	}
 	writeJSON(w, http.StatusOK, map[string]any{"head": head, "entries": entries})
 }
 
@@ -295,8 +347,7 @@ func (s *Server) handleJournalImport(w http.ResponseWriter, r *http.Request, ev 
 
 // handleAdminStats returns a compact dashboard snapshot for the admin view:
 // subscriber counts, presence, active alarms and journal size/head.
-func (s *Server) handleAdminStats(w http.ResponseWriter, r *http.Request, ev *protocol.Envelope) {
-	ctx := r.Context()
+func (s *Server) handleAdminStats(w http.ResponseWriter, r *http.Request, ev *protocol.Envelope) {	ctx := r.Context()
 	subs, err := s.st.ListSubscribers(ctx)
 	if err != nil {
 		writeErr(w, http.StatusInternalServerError, "list subscribers")
@@ -334,4 +385,107 @@ func (s *Server) handleAdminStats(w http.ResponseWriter, r *http.Request, ev *pr
 		"journal_entries": count,
 		"journal_head":    head,
 	})
+}
+
+// handleGetSubscriberKey перевыпускает файл ключа из escrow админа
+// (приватный ключ хранится в зашифрованной базе). Только admin.
+func (s *Server) handleGetSubscriberKey(w http.ResponseWriter, r *http.Request, ev *protocol.Envelope) {
+	var req struct {
+		Callsign string `json:"callsign"`
+	}
+	if err := json.Unmarshal(ev.Data, &req); err != nil || req.Callsign == "" {
+		writeErr(w, http.StatusBadRequest, "callsign required")
+		return
+	}
+	callsign := normalizeCallsign(req.Callsign)
+	if callsign == "" {
+		writeErr(w, http.StatusBadRequest, "bad callsign")
+		return
+	}
+	priv, err := s.st.SubscriberPrivkey(r.Context(), callsign)
+	if err != nil {
+		if errors.Is(err, db.ErrNotFound) {
+			writeErr(w, http.StatusNotFound, "unknown callsign")
+			return
+		}
+		writeErr(w, http.StatusInternalServerError, "subscriber key")
+		return
+	}
+	if priv == "" {
+		writeErr(w, http.StatusNotFound, "no stored key for this callsign (created before escrow)")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"callsign":    callsign,
+		"private_pem": priv,
+	})
+}
+
+// handleListChats returns named chats visible to the caller: members see
+// their chats, admin sees everything.
+func (s *Server) handleListChats(w http.ResponseWriter, r *http.Request, ev *protocol.Envelope) {
+	role, err := s.ver.Role(r.Context(), ev.Sender)
+	if err != nil {
+		writeErr(w, http.StatusUnauthorized, "unknown sender")
+		return
+	}
+	var chats []db.Chat
+	if role == "admin" {
+		chats, err = s.st.ListChats(r.Context())
+	} else {
+		chats, err = s.st.ListChatsFor(r.Context(), ev.Sender)
+	}
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, "list chats")
+		return
+	}
+	if chats == nil {
+		chats = []db.Chat{}
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"chats": chats})
+}
+
+// handleChatSubmit creates/updates/archives a named chat (admin only).
+func (s *Server) handleChatSubmit(w http.ResponseWriter, r *http.Request, ev *protocol.Envelope) {
+	role, err := s.ver.Role(r.Context(), ev.Sender)
+	if err != nil {
+		writeErr(w, http.StatusUnauthorized, "unknown sender")
+		return
+	}
+	if role != "admin" {
+		writeErr(w, http.StatusForbidden, "admin role required")
+		return
+	}
+	f := protocol.Frame{
+		Sender:    ev.Sender,
+		TS:        ev.TS,
+		Nonce:     ev.Nonce,
+		Kind:      ev.Kind,
+		Signature: ev.Signature,
+		Data:      ev.Data,
+	}
+	switch ev.Kind {
+	case "chat_create":
+		rec, err := s.hub.IngestChatCreate(r.Context(), f, role)
+		if err != nil {
+			writeErr(w, http.StatusBadRequest, fmt.Sprintf("chat create rejected: %v", err))
+			return
+		}
+		writeJSON(w, http.StatusCreated, rec)
+	case "chat_update":
+		rec, err := s.hub.IngestChatUpdate(r.Context(), f, role)
+		if err != nil {
+			writeErr(w, http.StatusBadRequest, fmt.Sprintf("chat update rejected: %v", err))
+			return
+		}
+		writeJSON(w, http.StatusOK, rec)
+	case "chat_delete":
+		if err := s.hub.IngestChatDelete(r.Context(), f, role); err != nil {
+			writeErr(w, http.StatusBadRequest, fmt.Sprintf("chat delete rejected: %v", err))
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]bool{"deleted": true})
+	default:
+		writeErr(w, http.StatusBadRequest, "unsupported kind")
+	}
 }

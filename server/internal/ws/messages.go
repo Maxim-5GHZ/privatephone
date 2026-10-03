@@ -19,6 +19,7 @@ type Snapshot struct {
 	Messages []db.Message `json:"messages"`
 	Alerts   []db.Alert   `json:"alerts"`
 	Zones    []db.Zone    `json:"zones"`
+	Chats    []db.Chat    `json:"chats,omitempty"`
 	Online   []string     `json:"online"`
 }
 

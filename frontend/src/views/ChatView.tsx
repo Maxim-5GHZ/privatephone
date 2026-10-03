@@ -1,8 +1,9 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
-import { Message, Subscriber } from '../types'
+import { Chat, Message, Subscriber } from '../types'
 
 interface Props {
   messages: Message[]
+  chats: Chat[]
   subscribers: Subscriber[]
   online: string[]
   myCallsign: string
@@ -15,11 +16,13 @@ interface Thread {
   title: string
   recipient: string
   isGroup: boolean
+  isChat: boolean
   members: string[]
 }
 
 function canonicalRecipient(r: string): string {
   if (r === '') return 'general'
+  if (r.startsWith('chat:')) return r
   if (r[0] === '[') {
     try {
       const list = JSON.parse(r) as string[]
@@ -33,10 +36,10 @@ function canonicalRecipient(r: string): string {
 
 function threadForRecipient(r: string, title: string, members: string[]): Thread {
   const key = canonicalRecipient(r)
-  return { key, title, recipient: r, isGroup: key.startsWith('g:'), members }
+  return { key, title, recipient: r, isGroup: key.startsWith('g:'), isChat: key.startsWith('chat:'), members }
 }
 
-export function ChatView({ messages, subscribers, online, myCallsign, onSend, onCall }: Props) {
+export function ChatView({ messages, chats, subscribers, online, myCallsign, onSend, onCall }: Props) {
   const [active, setActive] = useState<Thread>(() => threadForRecipient('', 'Общий', [myCallsign]))
   const [body, setBody] = useState('')
   const [showGroup, setShowGroup] = useState(false)
@@ -45,6 +48,17 @@ export function ChatView({ messages, subscribers, online, myCallsign, onSend, on
 
   const threads = useMemo(() => {
     const out: Thread[] = [threadForRecipient('', 'Общий', [myCallsign])]
+    // named chats created by admin first
+    for (const c of chats) {
+      out.push({
+        key: `chat:${c.id}`,
+        title: `⌖ ${c.name}`,
+        recipient: `chat:${c.id}`,
+        isGroup: true,
+        isChat: true,
+        members: c.members,
+      })
+    }
     const groupSeen = new Set<string>()
     for (const s of subscribers) {
       if (s.callsign !== myCallsign) {
@@ -64,13 +78,14 @@ export function ChatView({ messages, subscribers, online, myCallsign, onSend, on
             title: members.join(', '),
             recipient: r,
             isGroup: true,
+            isChat: false,
             members: members.filter((x) => x !== myCallsign),
           })
         }
       }
     }
     return out
-  }, [messages, subscribers, myCallsign])
+  }, [messages, subscribers, chats, myCallsign])
 
   useEffect(() => {
     listRef.current?.scrollTo({ top: listRef.current.scrollHeight })
@@ -79,6 +94,9 @@ export function ChatView({ messages, subscribers, online, myCallsign, onSend, on
   const threadMessages = useMemo(() => {
     return messages.filter((m) => {
       const key = canonicalRecipient(m.recipient)
+      if (active.isChat) {
+        return m.recipient === active.recipient
+      }
       if (active.isGroup) {
         return key === active.key
       }
@@ -99,7 +117,7 @@ export function ChatView({ messages, subscribers, online, myCallsign, onSend, on
     if (groupPick.length === 0) return
     const members = [...groupPick, myCallsign].sort()
     const recipient = JSON.stringify(members)
-    setActive({ key: 'g:' + members.join(','), title: members.filter((x) => x !== myCallsign).join(', '), recipient, isGroup: true, members: members.filter((x) => x !== myCallsign) })
+    setActive({ key: 'g:' + members.join(','), title: members.filter((x) => x !== myCallsign).join(', '), recipient, isGroup: true, isChat: false, members: members.filter((x) => x !== myCallsign) })
     setShowGroup(false)
     setGroupPick([])
   }
@@ -145,8 +163,11 @@ export function ChatView({ messages, subscribers, online, myCallsign, onSend, on
 
       <div className="chat-area">
         <div className="chat-head">
-          <span className="muted">{active.isGroup ? 'группа' : active.recipient === '' ? 'всем' : 'директ'}:</span>{' '}
+          <span className="muted">
+            {active.isChat ? 'чат' : active.isGroup ? 'группа' : active.recipient === '' ? 'всем' : 'директ'}:
+          </span>{' '}
           <b>{active.title}</b>
+          {active.isChat && <span className="muted"> · {active.members.join(', ')}</span>}
           {canCall && (
             <button className="call-btn" onClick={() => onCall(active.recipient)}>
               Позвонить

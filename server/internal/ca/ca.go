@@ -17,6 +17,8 @@ type Result struct {
 
 // Create generates a key pair, stores the public part in the vault and returns
 // the private PEM for offline delivery to the operator's flash drive.
+// The private part is ALSO kept in the encrypted vault (escrow with the admin)
+// so a lost flash can be re-issued via the admin UI.
 func Create(ctx context.Context, st *db.Store, callsign, role string) (*Result, error) {
 	id, err := crypto.NewID()
 	if err != nil {
@@ -34,7 +36,7 @@ func Create(ctx context.Context, st *db.Store, callsign, role string) (*Result, 
 	if err != nil {
 		return nil, err
 	}
-	if err := st.AddSubscriber(ctx, id, callsign, role, string(pubPEM)); err != nil {
+	if err := st.AddSubscriberWithKey(ctx, id, callsign, role, string(pubPEM), string(privPEM)); err != nil {
 		return nil, err
 	}
 	sub := &db.Subscriber{ID: id, Callsign: callsign, Role: role, PubKey: string(pubPEM)}

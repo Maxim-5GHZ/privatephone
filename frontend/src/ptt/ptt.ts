@@ -30,6 +30,8 @@ export interface PttHandlers {
   onError: (message: string) => void
   /** media-layer security: true when SFrame is actually applied */
   onLink: (secure: boolean) => void
+  /** React sink: emitted on every new remote track and on peer drop (null). */
+  onStream?: (peer: string, stream: MediaStream | null) => void
 }
 
 interface PttWire {
@@ -139,6 +141,7 @@ export class PttController {
 
   closeAll(): void {
     for (const pc of this.peers.values()) pc.close()
+    const had = Array.from(this.peers.keys())
     this.peers.clear()
     for (const el of this.els.values()) {
       el.srcObject = null
@@ -155,6 +158,7 @@ export class PttController {
     this.groupKey = null
     this.handlers.onSession([])
     this.handlers.onTalking(null)
+    for (const peer of had) this.handlers.onStream?.(peer, null)
   }
 
   // relayed signaling comes in as the original signed frame. Only the routing
@@ -270,8 +274,10 @@ export class PttController {
     pc.ontrack = (ev) => {
       const el = this.ensureAudio(peer)
       if (this.secure) this.attachReceiverTransform(ev.transceiver.receiver)
-      el.srcObject = ev.streams[0] ?? new MediaStream([ev.track])
+      const stream = ev.streams[0] ?? new MediaStream([ev.track])
+      el.srcObject = stream
       void el.play().catch(() => {})
+      this.handlers.onStream?.(peer, stream)
     }
     pc.onconnectionstatechange = () => {
       if (pc.connectionState === 'failed' || pc.connectionState === 'closed') {
@@ -337,6 +343,7 @@ export class PttController {
       el.remove()
       this.els.delete(peer)
     }
+    this.handlers.onStream?.(peer, null)
     this.handlers.onSession(this.members.filter((m) => m === this.me || this.peers.has(m)))
   }
 

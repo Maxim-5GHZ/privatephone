@@ -185,6 +185,14 @@ CREATE TABLE IF NOT EXISTS zones (
 	n          TEXT,
 	created_at TEXT NOT NULL DEFAULT (datetime('now')),
 	inactive   INTEGER NOT NULL DEFAULT 0
+);
+CREATE TABLE IF NOT EXISTS chats (
+	id         TEXT PRIMARY KEY,
+	name       TEXT NOT NULL,
+	members    TEXT NOT NULL DEFAULT '[]',
+	creator    TEXT NOT NULL DEFAULT '',
+	created_at TEXT NOT NULL DEFAULT (datetime('now')),
+	archived   INTEGER NOT NULL DEFAULT 0
 );`
 	if _, err := s.db.Exec(schema); err != nil {
 		return fmt.Errorf("migrate: %w", err)
@@ -199,6 +207,9 @@ CREATE TABLE IF NOT EXISTS zones (
 		return err
 	}
 	if err := s.ensureColumn("subscribers", "revoked", "INTEGER NOT NULL DEFAULT 0"); err != nil {
+		return err
+	}
+	if err := s.ensureColumn("subscribers", "privkey", "TEXT NOT NULL DEFAULT ''"); err != nil {
 		return err
 	}
 	if err := s.backfillRecipient(context.Background()); err != nil {

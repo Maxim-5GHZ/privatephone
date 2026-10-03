@@ -1,6 +1,7 @@
 import { useRef, useState } from 'react'
-import { loginFromPem } from '../crypto/signing'
+import { loginFromPem, logout } from '../crypto/signing'
 import { fingerprintOfPrivate } from '../crypto/e2ee'
+import { apiGet } from '../api/client'
 
 export function Login({ onLogin }: { onLogin: (callsign: string) => void }) {
   const fileRef = useRef<HTMLInputElement>(null)
@@ -28,13 +29,30 @@ export function Login({ onLogin }: { onLogin: (callsign: string) => void }) {
     }
     setBusy(true)
     setError(null)
-    const ok = await loginFromPem(pem, callsign.trim().toLowerCase())
-    setBusy(false)
+    const cs = callsign.trim().toLowerCase()
+    const ok = await loginFromPem(pem, cs)
     if (!ok) {
+      setBusy(false)
       setError('Не удалось импортировать ключ (ожидается ECDSA P-256 PKCS#8)')
       return
     }
-    onLogin(callsign.trim().toLowerCase())
+    // Ключ в память встал — теперь проверяем его О СЕРВЕР: позывной должен
+    // быть в реестре ЭТОГО data-каталога, иначе дальше везде будет
+    // «invalid signature», а админка покажет «не админ».
+    try {
+      await apiGet('/api/v1/subscribers', 'list_subscribers')
+    } catch (e) {
+      logout()
+      setBusy(false)
+      setError(
+        `Сервер ключ не принял: ${(e as Error).message}. Возьмите файл из data-каталога ЭТОГО узла ` +
+          `(см. строку «мастер-ключ из половин» в логе сервера — admin.pem рядом с vault.db), ` +
+          `позывной — admin, и обновите страницу.`,
+      )
+      return
+    }
+    setBusy(false)
+    onLogin(cs)
   }
 
   return (

@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { decrypt, getEcdhKey, looksLikeEnvelope, parseEnvelope } from './e2ee'
 
 export interface DecryptItem {
@@ -26,10 +26,23 @@ export function pubKeyOf(it: DecryptItem): string | null {
 
 // useDecrypted decrypts the given fields (envelope or plaintext legacy rows)
 // and returns a Map id → plaintext. Null marks "could not decrypt".
-export function useDecrypted(items: DecryptItem[]): Map<string, string | null> {
+// The optional session busts the cache: bump it on logout so the next login
+// never reuses plaintext decrypted with the previous key.
+export function clearDecryptCache(): void {
+  cache.clear()
+}
+
+export function useDecrypted(items: DecryptItem[], session = 0): Map<string, string | null> {
   const [resolved, setResolved] = useState<Map<string, string | null>>(new Map())
+  const sessionRef = useRef(session)
 
   useEffect(() => {
+    if (sessionRef.current !== session) {
+      sessionRef.current = session
+      cache.clear()
+      setResolved(new Map())
+      return
+    }
     let live = true
     const pending: { it: DecryptItem; prom: Promise<string | null> }[] = []
     for (const it of items) {
@@ -55,7 +68,7 @@ export function useDecrypted(items: DecryptItem[]): Map<string, string | null> {
     return () => {
       live = false
     }
-  }, [items, resolved])
+  }, [items, resolved, session])
 
   return resolved
 }

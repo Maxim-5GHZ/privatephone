@@ -152,6 +152,12 @@ func (h *Hub) replayImport(ctx context.Context, e db.JournalEntry, role string) 
 		_, err = h.IngestZoneUpdate(ctx, f)
 	case "zone_delete":
 		err = h.IngestZoneDelete(ctx, f, role)
+	case "chat_create":
+		_, err = h.IngestChatCreate(ctx, f, role)
+	case "chat_update":
+		_, err = h.IngestChatUpdate(ctx, f, role)
+	case "chat_delete":
+		err = h.IngestChatDelete(ctx, f, role)
 	case "revoke_subscriber", "unrevoke_subscriber":
 		err = h.replayRevoke(ctx, f, role)
 		return err == nil, false, err

@@ -8,6 +8,7 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"net/url"
 	"time"
 
 	"privatephone/server/internal/db"
@@ -47,14 +48,21 @@ func New(st *db.Store, hub *ws.Hub, ver *protocol.Verifier, addr string) *Server
 	mux.Handle("POST /api/v1/messages", s.signed(s.handleSubmit))
 	mux.Handle("POST /api/v1/alerts", s.signed(s.handleSubmit))
 	mux.Handle("POST /api/v1/zones", s.signed(s.handleSubmit))
+	mux.HandleFunc("GET /api/v1/chats", s.signed(s.handleListChats))
+	mux.Handle("POST /api/v1/chats", s.signed(s.handleChatSubmit))
 	mux.Handle("POST /api/v1/ca/subscribers", s.signedAdmin(s.handleCreateSubscriber))
+	mux.Handle("POST /api/v1/ca/subscribers/key", s.signedAdmin(s.handleGetSubscriberKey))
 	mux.Handle("POST /api/v1/ca/revoke", s.signedAdmin(s.handleSubscriberStatus))
 	mux.Handle("GET /api/v1/journal", s.signedAdmin(s.handleJournalExport))
 	mux.Handle("POST /api/v1/journal/verify", s.signedAdmin(s.handleJournalVerify))
 	mux.Handle("POST /api/v1/journal/import", s.signedAdmin(s.handleJournalImport))
 	mux.Handle("GET /api/v1/admin/stats", s.signedAdmin(s.handleAdminStats))
+	mux.Handle("GET /api/v1/admin/tiles/status", s.signedAdmin(s.handleTilesStatus))
+	mux.Handle("POST /api/v1/admin/tiles", s.signedAdmin(s.handleTilePut))
+	mux.Handle("POST /api/v1/admin/tiles/bag", s.signedAdminLarge(maxBagBody, s.handleTilesBag))
+	mux.Handle("POST /api/v1/admin/tiles/clear", s.signedAdmin(s.handleTilesClear))
 
-	mux.Handle("/tiles/", http.StripPrefix("/tiles/", http.FileServer(http.FS(web.Tiles()))))
+	mux.HandleFunc("/tiles/", s.serveTiles)
 	mux.Handle("/", s.spa(web.Dist()))
 
 	s.srv = &http.Server{
@@ -137,8 +145,17 @@ func (s *Server) decodeEnvelope(r *http.Request) (*protocol.Envelope, error) {
 		return nil, errors.New("read body")
 	}
 	_ = r.Body.Close()
+	// X-Sender arrives percent-encoded when the callsign is non-ASCII
+	// (frontend encodeURIComponent, e.g. Cyrillic). PathUnescape restores
+	// the raw callsign for lookup and signature verification; latin names
+	// pass through unchanged. Path (not Query) unescape: '+' stays '+'.
+	senderRaw := r.Header.Get("X-Sender")
+	sender, uerr := url.PathUnescape(senderRaw)
+	if uerr != nil {
+		sender = senderRaw
+	}
 	ev := &protocol.Envelope{
-		Sender:    r.Header.Get("X-Sender"),
+		Sender:    sender,
 		Signature: r.Header.Get("X-Signature"),
 		Nonce:     r.Header.Get("X-Nonce"),
 		Kind:      r.Header.Get("X-Kind"),

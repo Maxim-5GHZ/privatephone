@@ -40,12 +40,21 @@ export interface Message {
   encrypted?: boolean
 }
 
+export interface Chat {
+  id: string
+  name: string
+  members: string[]
+  creator: string
+  created_at: string
+}
+
 export interface Subscriber {
   id: string
   callsign: string
   role: string
   pubkey: string
   revoked?: number
+  has_key?: boolean
 }
 
 export interface Packet {
@@ -64,6 +73,7 @@ export interface Snapshot {
   messages: Message[]
   alerts?: Alert[]
   zones?: Zone[]
+  chats?: Chat[]
   online: string[]
 }
 
@@ -86,6 +96,9 @@ export type WSMsg =
   | { kind: 'marker_updated'; data: Marker }
   | { kind: 'marker_deleted'; data: { sender: string; n: string; id?: number } }
   | { kind: 'message'; data: Message }
+  | { kind: 'chat_created'; data: Chat }
+  | { kind: 'chat_updated'; data: Chat }
+  | { kind: 'chat_deleted'; data: { id: string } }
   | { kind: 'alert'; data: Alert }
   | { kind: 'alert_acks'; data: { id: number; author: string; n: string; sender: string } }
   | { kind: 'alert_cleared'; data: { id: number; author: string; n: string; by: string } }

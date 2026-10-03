@@ -131,13 +131,35 @@ func (h *Hub) pushBacklog(ctx context.Context, c *client) {
 	if err != nil {
 		return
 	}
-	snap := outSnap{Kind: "snapshot", Data: Snapshot{Markers: markers, Messages: messages, Alerts: alerts, Zones: zones, Online: h.Online()}}
+	chats, err := h.st.ListChatsFor(ctx, me)
+	if err != nil {
+		chats = nil
+	}
+	if markers == nil {
+		markers = []db.Marker{}
+	}
+	if messages == nil {
+		messages = []db.Message{}
+	}
+	if alerts == nil {
+		alerts = []db.Alert{}
+	}
+	if zones == nil {
+		zones = []db.Zone{}
+	}
+	if chats == nil {
+		chats = []db.Chat{}
+	}
+	snap := outSnap{Kind: "snapshot", Data: Snapshot{Markers: markers, Messages: messages, Alerts: alerts, Zones: zones, Chats: chats, Online: h.Online()}}
 	if b, err := json.Marshal(snap); err == nil {
 		c.enqueue(b)
 	}
 	undelivered, err := h.st.UndeliveredPacketsFor(ctx, me)
 	if err != nil {
 		return
+	}
+	if undelivered == nil {
+		undelivered = []db.Packet{}
 	}
 	if b, err := json.Marshal(outPackets{Kind: "packets", Data: packets{Items: undelivered}}); err == nil {
 		c.enqueue(b)

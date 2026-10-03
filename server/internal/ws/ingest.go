@@ -100,8 +100,9 @@ func (h *Hub) IngestMarkerDelete(ctx context.Context, f protocol.Frame, role str
 }
 
 // IngestMessage validates and persists a text message, then routes it to the
-// addressed recipients ("" = broadcast). E2EE bodies are carried as an opaque
-// envelope in place of the plaintext text; routing fields stay readable.
+// addressed recipients ("" = broadcast, "chat:<id>" = named chat members).
+// E2EE bodies are carried as an opaque envelope in place of the plaintext
+// text; routing fields stay readable.
 func (h *Hub) IngestMessage(ctx context.Context, f protocol.Frame) (db.Message, error) {
 	var m struct {
 		Recipient string          `json:"recipient"`
@@ -112,6 +113,16 @@ func (h *Hub) IngestMessage(ctx context.Context, f protocol.Frame) (db.Message, 
 	var rec db.Message
 	if err := json.Unmarshal(f.Data, &m); err != nil {
 		return rec, err
+	}
+	// named chats: sender must be a member, delivery expands to members.
+	if len(m.Recipient) > 5 && m.Recipient[:5] == "chat:" {
+		ok, err := h.isChatMember(ctx, f.Sender, m.Recipient)
+		if err != nil || !ok {
+			if err == nil {
+				err = errors.New("not a chat member")
+			}
+			return rec, err
+		}
 	}
 	body := m.Body
 	if enc, ok := encCargo(f.Data); ok {
@@ -124,7 +135,8 @@ func (h *Hub) IngestMessage(ctx context.Context, f protocol.Frame) (db.Message, 
 	rec = db.Message{ID: id, Sender: f.Sender, Recipient: m.Recipient, Body: body, Nonce: m.N, Created: now()}
 	h.journal(ctx, f, m.Recipient)
 	b, _ := json.Marshal(out{Kind: "message", Data: rec})
-	h.deliver(b, parseRecipients(m.Recipient), f.Sender)
+	recips, _ := h.expandMessageRecipients(ctx, m.Recipient)
+	h.deliver(b, recips, f.Sender)
 	return rec, nil
 }
 

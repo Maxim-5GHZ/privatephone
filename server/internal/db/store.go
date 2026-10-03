@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"database/sql"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"strconv"
 	"strings"
@@ -25,6 +26,9 @@ type Subscriber struct {
 	Role     string `json:"role"`
 	PubKey   string `json:"pubkey"`
 	Revoked  int64  `json:"revoked"`
+	// HasKey: приватный ключ на escrow у админа (можно перевыпустить файл).
+	// Сам ключ никогда не отдаётся в списке — только через отдельный endpoint.
+	HasKey bool `json:"has_key"`
 }
 
 type Marker struct {
@@ -77,6 +81,17 @@ type Message struct {
 	Created   string `json:"created_at"`
 }
 
+// Chat is a named group channel created by an admin. Members is a JSON array
+// of callsigns, e.g. ["alice","bob"]. Messages addressed to the chat use
+// recipient "chat:<id>" and are visible only to members (plus admin).
+type Chat struct {
+	ID      string   `json:"id"`
+	Name    string   `json:"name"`
+	Members []string `json:"members"`
+	Creator string   `json:"creator"`
+	Created string   `json:"created_at"`
+}
+
 type Packet struct {
 	ID        string `json:"id"`
 	Sender    string `json:"sender"`
@@ -105,9 +120,15 @@ type JournalEntry struct {
 }
 
 func (s *Store) AddSubscriber(ctx context.Context, id, callsign, role, pubkey string) error {
+	return s.AddSubscriberWithKey(ctx, id, callsign, role, pubkey, "")
+}
+
+// AddSubscriberWithKey регистрирует абонента и кладёт приватный ключ на escrow
+// к админу (в зашифрованную базу). Пустой privkey — без escrow (легаси/тесты).
+func (s *Store) AddSubscriberWithKey(ctx context.Context, id, callsign, role, pubkey, privkey string) error {
 	_, err := s.db.ExecContext(ctx,
-		`INSERT INTO subscribers (id, callsign, role, pubkey) VALUES (?, ?, ?, ?)`,
-		id, callsign, role, pubkey)
+		`INSERT INTO subscribers (id, callsign, role, pubkey, privkey) VALUES (?, ?, ?, ?, ?)`,
+		id, callsign, role, pubkey, privkey)
 	if err != nil {
 		if isUniqueViolation(err) {
 			return errors.Join(ErrDuplicate, err)
@@ -118,23 +139,40 @@ func (s *Store) AddSubscriber(ctx context.Context, id, callsign, role, pubkey st
 	return nil
 }
 
+// SubscriberPrivkey отдаёт escrow-копию приватного ключа (только для ручки
+// админа). Пусто — значит ключ не хранится (абонент до escrow).
+func (s *Store) SubscriberPrivkey(ctx context.Context, callsign string) (string, error) {
+	var priv string
+	err := s.db.QueryRowContext(ctx,
+		`SELECT privkey FROM subscribers WHERE callsign = ?`, callsign).Scan(&priv)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", ErrNotFound
+	}
+	if err != nil {
+		return "", err
+	}
+	return priv, nil
+}
+
 func (s *Store) SubscriberByCallsign(ctx context.Context, callsign string) (*Subscriber, error) {
 	row := s.db.QueryRowContext(ctx,
-		`SELECT id, callsign, role, pubkey, revoked FROM subscribers WHERE callsign = ?`, callsign)
+		`SELECT id, callsign, role, pubkey, revoked, (CASE WHEN privkey <> '' THEN 1 ELSE 0 END) FROM subscribers WHERE callsign = ?`, callsign)
 	sub := &Subscriber{}
-	err := row.Scan(&sub.ID, &sub.Callsign, &sub.Role, &sub.PubKey, &sub.Revoked)
+	var hasKey int
+	err := row.Scan(&sub.ID, &sub.Callsign, &sub.Role, &sub.PubKey, &sub.Revoked, &hasKey)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, ErrNotFound
 	}
 	if err != nil {
 		return nil, err
 	}
+	sub.HasKey = hasKey != 0
 	return sub, nil
 }
 
 func (s *Store) ListSubscribers(ctx context.Context) ([]Subscriber, error) {
 	rows, err := s.db.QueryContext(ctx,
-		`SELECT id, callsign, role, pubkey, revoked, created_at FROM subscribers ORDER BY created_at`)
+		`SELECT id, callsign, role, pubkey, revoked, (CASE WHEN privkey <> '' THEN 1 ELSE 0 END), created_at FROM subscribers ORDER BY created_at`)
 	if err != nil {
 		return nil, err
 	}
@@ -143,9 +181,11 @@ func (s *Store) ListSubscribers(ctx context.Context) ([]Subscriber, error) {
 	for rows.Next() {
 		var sub Subscriber
 		var created string
-		if err := rows.Scan(&sub.ID, &sub.Callsign, &sub.Role, &sub.PubKey, &sub.Revoked, &created); err != nil {
+		var hasKey int
+		if err := rows.Scan(&sub.ID, &sub.Callsign, &sub.Role, &sub.PubKey, &sub.Revoked, &hasKey, &created); err != nil {
 			return nil, err
 		}
+		sub.HasKey = hasKey != 0
 		out = append(out, sub)
 	}
 	return out, rows.Err()
@@ -480,12 +520,26 @@ func (s *Store) ListMessages(ctx context.Context) ([]Message, error) {
 }
 
 // ListMessagesFor returns only the messages the caller may see: broadcast,
-// direct/group addressed to them, or their own sends.
+// direct/group addressed to them, messages in named chats they belong to,
+// or their own sends.
 func (s *Store) ListMessagesFor(ctx context.Context, callsign string) ([]Message, error) {
-	rows, err := s.db.QueryContext(ctx,
-		`SELECT id, sender, recipient, body, n, created_at FROM messages
-		 WHERE recipient = '' OR sender = ? OR recipient = ? OR recipient LIKE ?
-		 ORDER BY id`, callsign, callsign, recipientMaybe(callsign))
+	chatRecipients, err := s.chatRecipientsFor(ctx, callsign)
+	if err != nil {
+		return nil, err
+	}
+	query := `SELECT id, sender, recipient, body, n, created_at FROM messages
+		 WHERE recipient = '' OR sender = ? OR recipient = ? OR recipient LIKE ?`
+	args := []any{callsign, callsign, recipientMaybe(callsign)}
+	if len(chatRecipients) > 0 {
+		placeholders := make([]string, len(chatRecipients))
+		for i, r := range chatRecipients {
+			placeholders[i] = "?"
+			args = append(args, r)
+		}
+		query += ` OR recipient IN (` + strings.Join(placeholders, ",") + `)`
+	}
+	query += ` ORDER BY id`
+	rows, err := s.db.QueryContext(ctx, query, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -686,12 +740,26 @@ func (s *Store) UndeliveredPackets(ctx context.Context) ([]Packet, error) {
 }
 
 // UndeliveredPacketsFor limits the store-and-forward backlog to what the caller
-// may see: broadcast, addressed to them, or their own sends.
+// may see: broadcast, addressed to them, their own sends, or named chats they
+// belong to.
 func (s *Store) UndeliveredPacketsFor(ctx context.Context, callsign string) ([]Packet, error) {
-	rows, err := s.db.QueryContext(ctx,
-		`SELECT id, sender, kind, payload, signature, nonce, recipient, ts FROM packets
-		 WHERE delivered = 0 AND (recipient = '' OR sender = ? OR recipient = ? OR recipient LIKE ?)
-		 ORDER BY ts`, callsign, callsign, recipientMaybe(callsign))
+	chatRecipients, err := s.chatRecipientsFor(ctx, callsign)
+	if err != nil {
+		return nil, err
+	}
+	query := `SELECT id, sender, kind, payload, signature, nonce, recipient, ts FROM packets
+		 WHERE delivered = 0 AND (recipient = '' OR sender = ? OR recipient = ? OR recipient LIKE ?`
+	args := []any{callsign, callsign, recipientMaybe(callsign)}
+	if len(chatRecipients) > 0 {
+		placeholders := make([]string, len(chatRecipients))
+		for i, r := range chatRecipients {
+			placeholders[i] = "?"
+			args = append(args, r)
+		}
+		query += ` OR recipient IN (` + strings.Join(placeholders, ",") + `)`
+	}
+	query += `) ORDER BY ts`
+	rows, err := s.db.QueryContext(ctx, query, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -731,6 +799,129 @@ func (s *Store) MarkDelivered(ctx context.Context, ids []string) error {
 
 func (s *Store) Ping(ctx context.Context) error {
 	return s.db.PingContext(ctx)
+}
+
+// DataDir returns the vault directory (used for runtime tile overrides).
+func (s *Store) DataDir() string { return s.dataDir }
+
+// CreateChat persists a named channel created by an admin.
+func (s *Store) CreateChat(ctx context.Context, id, name string, members []string, creator string) error {
+	raw, _ := json.Marshal(members)
+	_, err := s.db.ExecContext(ctx,
+		`INSERT INTO chats (id, name, members, creator) VALUES (?, ?, ?, ?)`,
+		id, name, string(raw), creator)
+	if err != nil {
+		if isUniqueViolation(err) {
+			return errors.Join(ErrDuplicate, err)
+		}
+		return err
+	}
+	s.markDirty()
+	return nil
+}
+
+// ChatByID returns a single chat by id.
+func (s *Store) ChatByID(ctx context.Context, id string) (*Chat, error) {
+	row := s.db.QueryRowContext(ctx,
+		`SELECT id, name, members, creator, created_at FROM chats WHERE id = ? AND archived = 0`, id)
+	var c Chat
+	var membersRaw string
+	err := row.Scan(&c.ID, &c.Name, &membersRaw, &c.Creator, &c.Created)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, ErrNotFound
+	}
+	if err != nil {
+		return nil, err
+	}
+	_ = json.Unmarshal([]byte(membersRaw), &c.Members)
+	if c.Members == nil {
+		c.Members = []string{}
+	}
+	return &c, nil
+}
+
+// ListChats returns all active chats (admin view).
+func (s *Store) ListChats(ctx context.Context) ([]Chat, error) {
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT id, name, members, creator, created_at FROM chats WHERE archived = 0 ORDER BY created_at, id`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []Chat
+	for rows.Next() {
+		var c Chat
+		var membersRaw string
+		if err := rows.Scan(&c.ID, &c.Name, &membersRaw, &c.Creator, &c.Created); err != nil {
+			return nil, err
+		}
+		_ = json.Unmarshal([]byte(membersRaw), &c.Members)
+		if c.Members == nil {
+			c.Members = []string{}
+		}
+		out = append(out, c)
+	}
+	return out, rows.Err()
+}
+
+// ListChatsFor returns chats visible to callsign (member or creator).
+func (s *Store) ListChatsFor(ctx context.Context, callsign string) ([]Chat, error) {
+	all, err := s.ListChats(ctx)
+	if err != nil {
+		return nil, err
+	}
+	var out []Chat
+	for _, c := range all {
+		for _, m := range c.Members {
+			if m == callsign {
+				out = append(out, c)
+				break
+			}
+		}
+	}
+	return out, nil
+}
+
+// chatRecipientsFor returns ["chat:<id>", ...] for chats containing callsign.
+func (s *Store) chatRecipientsFor(ctx context.Context, callsign string) ([]string, error) {
+	chats, err := s.ListChatsFor(ctx, callsign)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]string, 0, len(chats))
+	for _, c := range chats {
+		out = append(out, "chat:"+c.ID)
+	}
+	return out, nil
+}
+
+// UpdateChat renames a chat and/or replaces its member list.
+func (s *Store) UpdateChat(ctx context.Context, id, name string, members []string) (*Chat, error) {
+	raw, _ := json.Marshal(members)
+	res, err := s.db.ExecContext(ctx,
+		`UPDATE chats SET name = ?, members = ? WHERE id = ? AND archived = 0`, name, string(raw), id)
+	if err != nil {
+		return nil, err
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return nil, ErrNotFound
+	}
+	s.markDirty()
+	return s.ChatByID(ctx, id)
+}
+
+// DeleteChat archives a chat (messages stay in the journal for audit).
+func (s *Store) DeleteChat(ctx context.Context, id string) error {
+	res, err := s.db.ExecContext(ctx,
+		`UPDATE chats SET archived = 1 WHERE id = ? AND archived = 0`, id)
+	if err != nil {
+		return err
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return ErrNotFound
+	}
+	s.markDirty()
+	return nil
 }
 
 func isUniqueViolation(err error) bool {

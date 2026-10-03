@@ -1,9 +1,21 @@
 import { buildWSFrame, signPacket, SignedPacket } from '../crypto/signing'
 import type { Snapshot, WSMsg } from '../types'
 
+// encodeFetchHeaders percent-encodes X-Sender so non-ASCII callsigns
+// (e.g. Cyrillic) stay valid ByteString header values. fetch() throws
+// "has value 1073 which is greater than 255" for raw Cyrillic.
+// Latin callsigns are unchanged by encodeURIComponent (backward compatible);
+// the server PathUnescapes back to the raw callsign before verification.
+// WS frames are JSON (UTF-8) and keep the raw sender — only fetch headers
+// need this.
+function encodeFetchHeaders(h: Record<string, string>): Record<string, string> {
+  if (!h['X-Sender']) return h
+  return { ...h, 'X-Sender': encodeURIComponent(h['X-Sender']) }
+}
+
 export async function apiPost(path: string, kind: string, data: unknown): Promise<unknown> {
   const p = await signPacket(kind, data)
-  const resp = await fetch(path, { method: 'POST', headers: p.headers, body: p.body })
+  const resp = await fetch(path, { method: 'POST', headers: encodeFetchHeaders(p.headers), body: p.body })
   const json = await resp.json().catch(() => ({}))
   if (!resp.ok) throw new Error((json as { error?: string }).error ?? `HTTP ${resp.status}`)
   return json
@@ -11,7 +23,7 @@ export async function apiPost(path: string, kind: string, data: unknown): Promis
 
 export async function apiGet(path: string, kind: string): Promise<unknown> {
   const p = await signPacket(kind, '')
-  const resp = await fetch(path, { method: 'GET', headers: p.headers })
+  const resp = await fetch(path, { method: 'GET', headers: encodeFetchHeaders(p.headers) })
   const json = await resp.json().catch(() => ({}))
   if (!resp.ok) throw new Error((json as { error?: string }).error ?? `HTTP ${resp.status}`)
   return json
@@ -21,6 +33,15 @@ export async function apiGet(path: string, kind: string): Promise<unknown> {
 
 export async function revokeSubscriber(callsign: string, revoke: boolean): Promise<void> {
   await apiPost('/api/v1/ca/revoke', revoke ? 'revoke_subscriber' : 'unrevoke_subscriber', { callsign })
+}
+
+// Escrow: приватные ключи хранятся у админа в зашифрованной базе,
+// перевыпуск файла при утере флешки.
+export async function fetchSubscriberKey(callsign: string): Promise<{ callsign: string; private_pem: string }> {
+  return (await apiPost('/api/v1/ca/subscribers/key', 'get_subscriber_key', { callsign })) as {
+    callsign: string
+    private_pem: string
+  }
 }
 
 // --- Tamper-evident journal (admin) ---
@@ -143,4 +164,68 @@ export function connectWS(onMessage: WSHandler, onState: (open: boolean) => void
 export async function fetchSnapshot(): Promise<Snapshot> {
   const snap = (await apiGet('/api/v1/snapshot', 'snapshot')) as Snapshot
   return snap
+}
+
+// --- Named chats (admin creates, members read/write) ---
+
+export interface ChatDTO {
+  id: string
+  name: string
+  members: string[]
+  creator: string
+  created_at: string
+}
+
+export async function fetchChats(): Promise<ChatDTO[]> {
+  const out = (await apiGet('/api/v1/chats', 'list_chats')) as { chats: ChatDTO[] }
+  return out.chats ?? []
+}
+
+export async function createChat(name: string, members: string[]): Promise<ChatDTO> {
+  return (await apiPost('/api/v1/chats', 'chat_create', { name, members })) as ChatDTO
+}
+
+export async function updateChat(id: string, name: string, members: string[]): Promise<ChatDTO> {
+  return (await apiPost('/api/v1/chats', 'chat_update', { id, name, members })) as ChatDTO
+}
+
+export async function deleteChat(id: string): Promise<void> {
+  await apiPost('/api/v1/chats', 'chat_delete', { id })
+}
+
+// --- Custom offline tiles (admin uploads) ---
+
+export interface TilesStatus {
+  custom_tiles: number
+  custom_bytes: number
+}
+
+export async function fetchTilesStatus(): Promise<TilesStatus> {
+  return (await apiGet('/api/v1/admin/tiles/status', 'tiles_status')) as TilesStatus
+}
+
+function arrayBufferToB64(buf: ArrayBuffer): string {
+  const bytes = new Uint8Array(buf)
+  let bin = ''
+  const chunk = 0x8000
+  for (let i = 0; i < bytes.length; i += chunk) {
+    bin += String.fromCharCode(...bytes.subarray(i, i + chunk))
+  }
+  return btoa(bin)
+}
+
+export async function uploadTile(z: number, x: number, y: number, file: Blob): Promise<void> {
+  const buf = await file.arrayBuffer()
+  const png_b64 = arrayBufferToB64(buf)
+  await apiPost('/api/v1/admin/tiles', 'tiles_put', { z, x, y, png_b64 })
+}
+
+export async function uploadTilesBag(file: Blob): Promise<{ added: number; skipped: number }> {
+  const buf = await file.arrayBuffer()
+  const zip_b64 = arrayBufferToB64(buf)
+  return (await apiPost('/api/v1/admin/tiles/bag', 'tiles_bag', { zip_b64 })) as { added: number; skipped: number }
+}
+
+export async function clearTiles(): Promise<void> {
+  await apiPost('/api/v1/admin/tiles/clear', 'tiles_clear', {})
 }

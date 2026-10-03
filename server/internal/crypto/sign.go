@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/base64"
+	"math/big"
 	"strconv"
 	"strings"
 	"sync"
@@ -45,13 +46,38 @@ func Sign(priv *ecdsa.PrivateKey, canonical []byte) (string, error) {
 }
 
 // Verify checks base64(std) ECDSA signature over canonical bytes.
+// It accepts both ASN.1-DER signatures (Go crypto, new WebCrypto frontend)
+// and raw P1363 r||s signatures (64 bytes for P-256, legacy WebCrypto output),
+// so browsers that send the raw WebCrypto buffer keep working.
 func Verify(pub *ecdsa.PublicKey, canonical []byte, sigB64 string) bool {
-	sig, err := base64.StdEncoding.DecodeString(sigB64)
+	sig, err := decodeSigB64(sigB64)
 	if err != nil {
 		return false
 	}
 	hash := sha256.Sum256(canonical)
-	return ecdsa.VerifyASN1(pub, hash[:], sig)
+	if ecdsa.VerifyASN1(pub, hash[:], sig) {
+		return true
+	}
+	// Fallback: raw IEEE P1363 (r || s, 32+32 bytes for P-256).
+	if len(sig) == 64 {
+		r := new(big.Int).SetBytes(sig[:32])
+		s := new(big.Int).SetBytes(sig[32:])
+		return ecdsa.Verify(pub, hash[:], r, s)
+	}
+	return false
+}
+
+func decodeSigB64(s string) ([]byte, error) {
+	if b, err := base64.StdEncoding.DecodeString(s); err == nil {
+		return b, nil
+	}
+	if b, err := base64.URLEncoding.DecodeString(s); err == nil {
+		return b, nil
+	}
+	if b, err := base64.RawStdEncoding.DecodeString(s); err == nil {
+		return b, nil
+	}
+	return base64.RawURLEncoding.DecodeString(s)
 }
 
 // ReplayGuard rejects replayed nonces and out-of-window timestamps.

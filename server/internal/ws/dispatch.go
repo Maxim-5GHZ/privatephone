@@ -20,7 +20,10 @@ func (h *Hub) dispatch(ctx context.Context, c *client, data []byte) {
 	}
 	role, err := h.ver.Verify(ctx, f.Envelope())
 	if err != nil {
-		log.Printf("ws: dropping packet from %q: %v", f.Sender, err)
+		// Подсказка оператору: чаще всего это ключ из другого data-каталога
+		// (напр. make init в ./data, а запуск бинарника с ./build/data) или
+		// старый admin.pem после переустановки узла.
+		log.Printf("ws: dropping packet from %q: %v (проверьте: ключ <.prv.pem> и позывной должны быть из admin.pem/реестра ЭТОГО data-каталога)", f.Sender, err)
 		return
 	}
 	switch f.Kind {
@@ -73,6 +76,18 @@ func (h *Hub) dispatch(ctx context.Context, c *client, data []byte) {
 	case "zone_delete":
 		if err := h.IngestZoneDelete(ctx, f, role); err != nil {
 			log.Printf("ws: zone_delete: %v", err)
+		}
+	case "chat_create":
+		if _, err := h.IngestChatCreate(ctx, f, role); err != nil {
+			log.Printf("ws: chat_create: %v", err)
+		}
+	case "chat_update":
+		if _, err := h.IngestChatUpdate(ctx, f, role); err != nil {
+			log.Printf("ws: chat_update: %v", err)
+		}
+	case "chat_delete":
+		if err := h.IngestChatDelete(ctx, f, role); err != nil {
+			log.Printf("ws: chat_delete: %v", err)
 		}
 	case "call_invite", "call_accept", "call_reject", "call_bye", "ice":
 		h.relayCall(ctx, c, f)

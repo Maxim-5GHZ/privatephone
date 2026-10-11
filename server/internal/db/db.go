@@ -199,6 +199,18 @@ CREATE TABLE IF NOT EXISTS chats (
 	creator    TEXT NOT NULL DEFAULT '',
 	created_at TEXT NOT NULL DEFAULT (datetime('now')),
 	archived   INTEGER NOT NULL DEFAULT 0
+);
+CREATE TABLE IF NOT EXISTS files (
+	id         INTEGER PRIMARY KEY AUTOINCREMENT,
+	sender     TEXT NOT NULL,
+	recipient  TEXT,
+	name       TEXT NOT NULL,
+	mime       TEXT NOT NULL DEFAULT 'application/octet-stream',
+	size       INTEGER NOT NULL DEFAULT 0,
+	blob       TEXT NOT NULL DEFAULT '',
+	enc        TEXT NOT NULL DEFAULT '',
+	n          TEXT,
+	created_at TEXT NOT NULL DEFAULT (datetime('now'))
 );`
 	if _, err := s.db.Exec(schema); err != nil {
 		return fmt.Errorf("migrate: %w", err)
@@ -213,6 +225,9 @@ CREATE TABLE IF NOT EXISTS chats (
 		return err
 	}
 	if err := s.ensureColumn("subscribers", "revoked", "INTEGER NOT NULL DEFAULT 0"); err != nil {
+		return err
+	}
+	if err := s.ensureColumn("messages", "edited", "INTEGER NOT NULL DEFAULT 0"); err != nil {
 		return err
 	}
 	if err := s.dropEscrowColumn(); err != nil {

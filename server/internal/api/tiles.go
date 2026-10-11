@@ -9,6 +9,7 @@ import (
 	"io"
 	"io/fs"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -296,8 +297,14 @@ func (s *Server) decodeEnvelopeWithLimit(r *http.Request, limit int) (*protocol.
 		return nil, fmt.Errorf("read body")
 	}
 	_ = r.Body.Close()
+	// Same percent-decoding as decodeEnvelope: fetch() percent-encodes
+	// non-ASCII callsigns, the raw header would fail lookup/verification.
+	sender, uerr := url.PathUnescape(r.Header.Get("X-Sender"))
+	if uerr != nil {
+		sender = r.Header.Get("X-Sender")
+	}
 	ev := &protocol.Envelope{
-		Sender:    r.Header.Get("X-Sender"),
+		Sender:    sender,
 		Signature: r.Header.Get("X-Signature"),
 		Nonce:     r.Header.Get("X-Nonce"),
 		Kind:      r.Header.Get("X-Kind"),

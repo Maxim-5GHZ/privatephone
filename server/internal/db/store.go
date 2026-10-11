@@ -76,6 +76,26 @@ type Message struct {
 	Body      string `json:"body"`
 	Nonce     string `json:"n"`
 	Created   string `json:"created_at"`
+	// Edited is 1 when the author changed the body via message_update.
+	Edited int64 `json:"edited,omitempty"`
+}
+
+// File is one E2EE file/voice attachment. The node stores both parts opaque:
+// Blob is base64(AES-GCM(fileKey, bytes)), Enc is the e2ee v2 envelope JSON
+// wrapping fileKey (+name/mime/size) per recipient. Journal payload carries
+// the same fields, so sneaker-net bags replicate files like messages.
+type File struct {
+	ID        int64  `json:"id"`
+	Sender    string `json:"sender"`
+	Recipient string `json:"recipient"`
+	Name      string `json:"name"`
+	Mime      string `json:"mime"`
+	Size      int64  `json:"size"`
+	// Blob is base64 ciphertext; empty in snapshot metadata (fetch on demand).
+	Blob    string `json:"blob,omitempty"`
+	Enc     string `json:"enc"`
+	Nonce   string `json:"n"`
+	Created string `json:"created_at"`
 }
 
 // Chat is a named group channel created by an admin. Members is a JSON array
@@ -504,7 +524,7 @@ func (s *Store) AddMessage(ctx context.Context, sender, recipient, body, nonce s
 
 func (s *Store) ListMessages(ctx context.Context) ([]Message, error) {
 	rows, err := s.db.QueryContext(ctx,
-		`SELECT id, sender, recipient, body, n, created_at FROM messages ORDER BY id`)
+		`SELECT id, sender, recipient, body, n, created_at, edited FROM messages ORDER BY id`)
 	if err != nil {
 		return nil, err
 	}
@@ -512,7 +532,7 @@ func (s *Store) ListMessages(ctx context.Context) ([]Message, error) {
 	var out []Message
 	for rows.Next() {
 		var m Message
-		if err := rows.Scan(&m.ID, &m.Sender, &m.Recipient, &m.Body, &m.Nonce, &m.Created); err != nil {
+		if err := rows.Scan(&m.ID, &m.Sender, &m.Recipient, &m.Body, &m.Nonce, &m.Created, &m.Edited); err != nil {
 			return nil, err
 		}
 		out = append(out, m)
@@ -528,7 +548,7 @@ func (s *Store) ListMessagesFor(ctx context.Context, callsign string) ([]Message
 	if err != nil {
 		return nil, err
 	}
-	query := `SELECT id, sender, recipient, body, n, created_at FROM messages
+	query := `SELECT id, sender, recipient, body, n, created_at, edited FROM messages
 		 WHERE recipient = '' OR sender = ? OR recipient = ? OR recipient LIKE ? ESCAPE '\'`
 	args := []any{callsign, callsign, recipientMaybe(callsign)}
 	if len(chatRecipients) > 0 {
@@ -552,13 +572,176 @@ func (s *Store) ListMessagesFor(ctx context.Context, callsign string) ([]Message
 	var out []Message
 	for rows.Next() {
 		var m Message
-		if err := rows.Scan(&m.ID, &m.Sender, &m.Recipient, &m.Body, &m.Nonce, &m.Created); err != nil {
+		if err := rows.Scan(&m.ID, &m.Sender, &m.Recipient, &m.Body, &m.Nonce, &m.Created, &m.Edited); err != nil {
 			return nil, err
 		}
 		if !visibleTo(m.Sender, m.Recipient, callsign, chats) {
 			continue
 		}
 		out = append(out, m)
+	}
+	return out, rows.Err()
+}
+
+// ListMessagesPaged returns messages visible to callsign older than beforeID
+// (0 = latest), newest-first, capped at limit (clamped 1..200). Powers the
+// "load older history" endpoint; the live snapshot carries the newest slice.
+func (s *Store) ListMessagesPaged(ctx context.Context, callsign string, beforeID int64, limit int) ([]Message, bool, error) {
+	if limit <= 0 {
+		limit = 50
+	}
+	if limit > 200 {
+		limit = 200
+	}
+	chatRecipients, err := s.chatRecipientsFor(ctx, callsign)
+	if err != nil {
+		return nil, false, err
+	}
+	query := `SELECT id, sender, recipient, body, n, created_at, edited FROM messages
+		 WHERE (recipient = '' OR sender = ? OR recipient = ? OR recipient LIKE ? ESCAPE '\'`
+	args := []any{callsign, callsign, recipientMaybe(callsign)}
+	if len(chatRecipients) > 0 {
+		placeholders := make([]string, len(chatRecipients))
+		for i, r := range chatRecipients {
+			placeholders[i] = "?"
+			args = append(args, r)
+		}
+		query += ` OR recipient IN (` + strings.Join(placeholders, ",") + `)`
+	}
+	query += `)`
+	if beforeID > 0 {
+		query += ` AND id < ?`
+		args = append(args, beforeID)
+	}
+	query += ` ORDER BY id DESC LIMIT ?`
+	args = append(args, limit+1)
+	rows, err := s.db.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, false, err
+	}
+	defer rows.Close()
+	chats := make(map[string]bool, len(chatRecipients))
+	for _, r := range chatRecipients {
+		chats[r] = true
+	}
+	var out []Message
+	for rows.Next() {
+		var m Message
+		if err := rows.Scan(&m.ID, &m.Sender, &m.Recipient, &m.Body, &m.Nonce, &m.Created, &m.Edited); err != nil {
+			return nil, false, err
+		}
+		if !visibleTo(m.Sender, m.Recipient, callsign, chats) {
+			continue
+		}
+		// oldest-first for the UI list
+		out = append([]Message{m}, out...)
+	}
+	more := len(out) > limit
+	if more {
+		out = out[len(out)-limit:]
+	}
+	return out, more, rows.Err()
+}
+
+// MessageByNonce fetches one message by author + creation nonce (edit/delete
+// addressing; the envelope `n` is always fresh, like markers/zones).
+func (s *Store) MessageByNonce(ctx context.Context, sender, nonce string) (Message, error) {
+	var m Message
+	err := s.db.QueryRowContext(ctx,
+		`SELECT id, sender, recipient, body, n, created_at, edited FROM messages WHERE sender = ? AND n = ?`,
+		sender, nonce).Scan(&m.ID, &m.Sender, &m.Recipient, &m.Body, &m.Nonce, &m.Created, &m.Edited)
+	if errors.Is(err, sql.ErrNoRows) {
+		return m, ErrNotFound
+	}
+	return m, err
+}
+
+// UpdateMessageBody replaces the body and marks the row edited.
+func (s *Store) UpdateMessageBody(ctx context.Context, id int64, body string) error {
+	_, err := s.db.ExecContext(ctx, `UPDATE messages SET body = ?, edited = 1 WHERE id = ?`, body, id)
+	if err == nil {
+		s.markDirty()
+	}
+	return err
+}
+
+// DeleteMessage removes the row (the signed journal packet stays for audit).
+func (s *Store) DeleteMessage(ctx context.Context, id int64) error {
+	_, err := s.db.ExecContext(ctx, `DELETE FROM messages WHERE id = ?`, id)
+	if err == nil {
+		s.markDirty()
+	}
+	return err
+}
+
+// AddFile stores one E2EE file record (blob + key envelope opaque).
+func (s *Store) AddFile(ctx context.Context, sender, recipient, name, mime string, size int64, blob, enc, nonce string) (int64, error) {
+	res, err := s.db.ExecContext(ctx,
+		`INSERT INTO files (sender, recipient, name, mime, size, blob, enc, n) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+		sender, recipient, name, mime, size, blob, enc, nonce)
+	if err != nil {
+		return 0, err
+	}
+	s.markDirty()
+	return res.LastInsertId()
+}
+
+// FileByNonce fetches one file by author + creation nonce.
+func (s *Store) FileByNonce(ctx context.Context, sender, nonce string) (File, error) {
+	var f File
+	err := s.db.QueryRowContext(ctx,
+		`SELECT id, sender, recipient, name, mime, size, blob, enc, n, created_at FROM files WHERE sender = ? AND n = ?`,
+		sender, nonce).Scan(&f.ID, &f.Sender, &f.Recipient, &f.Name, &f.Mime, &f.Size, &f.Blob, &f.Enc, &f.Nonce, &f.Created)
+	if errors.Is(err, sql.ErrNoRows) {
+		return f, ErrNotFound
+	}
+	return f, err
+}
+
+// fileVisible reuses the message visibility rules (files ride the same
+// recipient addressing: broadcast / direct / group / named chat).
+func fileVisible(sender, recipient, callsign string, chats map[string]bool) bool {
+	return visibleTo(sender, recipient, callsign, chats)
+}
+
+// ListFilesFor returns file records visible to callsign. Blobs are stripped
+// (metadata only) — fetch the bytes on demand via FileByNonce.
+func (s *Store) ListFilesFor(ctx context.Context, callsign string) ([]File, error) {
+	chatRecipients, err := s.chatRecipientsFor(ctx, callsign)
+	if err != nil {
+		return nil, err
+	}
+	query := `SELECT id, sender, recipient, name, mime, size, enc, n, created_at FROM files
+		 WHERE recipient = '' OR sender = ? OR recipient = ? OR recipient LIKE ? ESCAPE '\'`
+	args := []any{callsign, callsign, recipientMaybe(callsign)}
+	if len(chatRecipients) > 0 {
+		placeholders := make([]string, len(chatRecipients))
+		for i, r := range chatRecipients {
+			placeholders[i] = "?"
+			args = append(args, r)
+		}
+		query += ` OR recipient IN (` + strings.Join(placeholders, ",") + `)`
+	}
+	query += ` ORDER BY id`
+	rows, err := s.db.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	chats := make(map[string]bool, len(chatRecipients))
+	for _, r := range chatRecipients {
+		chats[r] = true
+	}
+	var out []File
+	for rows.Next() {
+		var f File
+		if err := rows.Scan(&f.ID, &f.Sender, &f.Recipient, &f.Name, &f.Mime, &f.Size, &f.Enc, &f.Nonce, &f.Created); err != nil {
+			return nil, err
+		}
+		if !fileVisible(f.Sender, f.Recipient, callsign, chats) {
+			continue
+		}
+		out = append(out, f)
 	}
 	return out, rows.Err()
 }

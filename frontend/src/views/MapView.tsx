@@ -35,6 +35,44 @@ interface ZoneDraft {
 
 type TileSource = 'osm' | 'sat'
 
+const VIEW_KEY = 'pp.map.view'
+const BASE_KEY = 'pp.map.base'
+const HIDEOLD_KEY = 'pp.map.hideOld'
+
+function loadView(): { center: [number, number]; zoom: number } {
+  try {
+    const raw = localStorage.getItem(VIEW_KEY)
+    if (raw) {
+      const v = JSON.parse(raw) as { lon?: number; lat?: number; zoom?: number }
+      if (typeof v.lon === 'number' && typeof v.lat === 'number' && typeof v.zoom === 'number') {
+        if (Number.isFinite(v.lon) && Number.isFinite(v.lat) && v.zoom >= 0 && v.zoom <= 16) {
+          return { center: [v.lon, v.lat], zoom: v.zoom }
+        }
+      }
+    }
+  } catch {
+    /* ignore */
+  }
+  return { center: [37.6175, 55.7517], zoom: 6 }
+}
+
+function loadBase(): TileSource {
+  try {
+    if (localStorage.getItem(BASE_KEY) === 'sat') return 'sat'
+  } catch {
+    /* ignore */
+  }
+  return 'osm'
+}
+
+function loadHideOld(): boolean {
+  try {
+    return localStorage.getItem(HIDEOLD_KEY) === '1'
+  } catch {
+    return false
+  }
+}
+
 function parseZonePoints(z: Zone): [number, number][] {
   try {
     const arr = JSON.parse(z.points) as unknown
@@ -100,14 +138,18 @@ export function MapView({
   const drawingRef = useRef(false)
   const drawPointsRef = useRef<[number, number][]>([])
 
-  const [base, setBase] = useState<TileSource>('osm')
+  const [base, setBase] = useState<TileSource>(loadBase)
   const [form, setForm] = useState<{ lat: number; lon: number } | null>(null)
   const [type, setType] = useState('enemy')
   const [desc, setDesc] = useState('')
   const [editing, setEditing] = useState<Marker | null>(null)
   const [editType, setEditType] = useState('')
   const [editDesc, setEditDesc] = useState('')
-  const [hideOld, setHideOld] = useState(false)
+  const [hideOld, setHideOld] = useState(loadHideOld)
+  // Two-step alarm confirm: first tap arms the button (prevents a stray
+  // glove tap from broadcasting SOS/СБОР), second tap within 5s sends it.
+  const [armedAlert, setArmedAlert] = useState<string | null>(null)
+  const armTimer = useRef<number | null>(null)
   const [drawing, setDrawing] = useState(false)
   const [draft, setDraft] = useState<ZoneDraft | null>(null)
   const [editingZone, setEditingZone] = useState<Zone | null>(null)
@@ -150,7 +192,26 @@ export function MapView({
     const map = new Map({
       target: divRef.current,
       layers: [osm, sat, markersLayer, drawLayer],
-      view: new View({ center: fromLonLat([37.6175, 55.7517]), zoom: 6, minZoom: 0, maxZoom: 16 }),
+      view: new View({ center: fromLonLat(loadView().center), zoom: loadView().zoom, minZoom: 0, maxZoom: 16 }),
+    })
+    // Persist viewport so switching tabs (MapView remounts) keeps the place.
+    map.getView().on('change:center', () => {
+      try {
+        const [lon, lat] = toLonLat(map.getView().getCenter() ?? fromLonLat([37.6175, 55.7517]))
+        const zoom = map.getView().getZoom() ?? 6
+        localStorage.setItem(VIEW_KEY, JSON.stringify({ lon, lat, zoom }))
+      } catch {
+        /* ignore */
+      }
+    })
+    map.getView().on('change:resolution', () => {
+      try {
+        const [lon, lat] = toLonLat(map.getView().getCenter() ?? fromLonLat([37.6175, 55.7517]))
+        const zoom = map.getView().getZoom() ?? 6
+        localStorage.setItem(VIEW_KEY, JSON.stringify({ lon, lat, zoom }))
+      } catch {
+        /* ignore */
+      }
     })
     map.on('click', (e) => {
       const live = liveRef.current
@@ -226,7 +287,38 @@ export function MapView({
   useEffect(() => {
     osmLayerRef.current?.setVisible(base === 'osm')
     satLayerRef.current?.setVisible(base === 'sat')
+    try {
+      localStorage.setItem(BASE_KEY, base)
+    } catch {
+      /* ignore */
+    }
   }, [base])
+
+  useEffect(() => {
+    try {
+      localStorage.setItem(HIDEOLD_KEY, hideOld ? '1' : '0')
+    } catch {
+      /* ignore */
+    }
+  }, [hideOld])
+
+  useEffect(() => {
+    return () => {
+      if (armTimer.current !== null) window.clearTimeout(armTimer.current)
+    }
+  }, [])
+
+  const pressAlert = (kind: string) => {
+    if (armedAlert !== kind) {
+      setArmedAlert(kind)
+      if (armTimer.current !== null) window.clearTimeout(armTimer.current)
+      armTimer.current = window.setTimeout(() => setArmedAlert(null), 5000)
+      return
+    }
+    if (armTimer.current !== null) window.clearTimeout(armTimer.current)
+    setArmedAlert(null)
+    onAlert(kind)
+  }
 
   // rebuild vector features from props (clears stale popups implicitly)
   useEffect(() => {
@@ -319,18 +411,31 @@ export function MapView({
     <div className="map-wrap">
       <div ref={divRef} className="map" />
       <div className="map-toolbar">
-        <select value={base} onChange={(e) => setBase(e.target.value as TileSource)} title="Слой карты">
+        <label className="sr-only" htmlFor="map-base">
+          Слой карты
+        </label>
+        <select id="map-base" value={base} onChange={(e) => setBase(e.target.value as TileSource)} title="Слой карты">
           <option value="osm">Схема</option>
           <option value="sat">Спутник</option>
         </select>
         <button className={drawing ? 'active' : ''} onClick={() => setDrawing((d) => !d)}>
-          Полигон
+          Полигон{drawing ? ' ✓' : ''}
         </button>
-        <button onClick={() => onAlert('sos')} style={{ background: '#c62828', color: '#fff' }}>
-          SOS
+        <button
+          onClick={() => pressAlert('sos')}
+          className={armedAlert === 'sos' ? 'alarm-armed' : ''}
+          style={{ background: armedAlert === 'sos' ? '#ff5252' : '#c62828', color: '#fff' }}
+          title={armedAlert === 'sos' ? 'Нажмите ещё раз для отправки SOS' : 'SOS — требуется подтверждение'}
+        >
+          {armedAlert === 'sos' ? 'SOS?! ЖМИ' : 'SOS'}
         </button>
-        <button onClick={() => onAlert('gather')} style={{ background: '#ef6c00', color: '#fff' }}>
-          СБОР
+        <button
+          onClick={() => pressAlert('gather')}
+          className={armedAlert === 'gather' ? 'alarm-armed' : ''}
+          style={{ background: armedAlert === 'gather' ? '#ff9800' : '#ef6c00', color: '#fff' }}
+          title={armedAlert === 'gather' ? 'Нажмите ещё раз для отправки СБОР' : 'СБОР — требуется подтверждение'}
+        >
+          {armedAlert === 'gather' ? 'СБОР?! ЖМИ' : 'СБОР'}
         </button>
         <label className="muted">
           <input type="checkbox" checked={hideOld} onChange={(e) => setHideOld(e.target.checked)} /> скрыть старые (&gt;24ч)

@@ -21,7 +21,8 @@ store-and-forward и ретрансляция сигналов звонков/р
 ### REST-эквивалент
 Поля идут в HTTP-заголовках (`X-Sender/X-Kind/X-TS/X-Nonce/X-Signature`), тело —
 сырые JSON-байты `data` (сервер собирает `Envelope`, `server.go:134-156`;
-лимит тела 1 MiB). Клиент — `signing.ts:96-103` + `api/client.ts:4-18`.
+лимит тела 1 MiB, для файлов `POST /api/v1/files` — 12 MiB через `signedLarge`,
+`files.go`). Клиент — `signing.ts:96-103` + `api/client.ts:4-18`.
 
 ### Подписываемый канон — см. `02-cryptography` §3.
 `v=1\nkind=…\nsender=…\nts=…\nnonce=…\n<данные>` — байт-в-байт на обеих сторонах;
@@ -33,18 +34,21 @@ store-and-forward и ретрансляция сигналов звонков/р
 | kind | Смысл | Источник |
 |---|---|---|
 | `marker`, `marker_update`, `marker_delete` | гео-метки на карте | dispatch.go:31-42 |
-| `message` | сообщение/группа/директ (поле `recipient`) | dispatch.go:43-46 |
-| `ack` | квитанция доставки пакетов (`{ids}`) | dispatch.go:47-48 |
-| `alert`, `alert_ack`, `alert_clear` | тревоги SOS/СБОР/Инфо, подтверждение, отбой | dispatch.go:49-64 |
-| `zone`, `zone_update`, `zone_delete` | зоны-полигоны | dispatch.go:65-76 |
-| `revoke_subscriber`, `unrevoke_subscriber` | CRL-команды админа | import.go:155-157 |
+| `message` | сообщение/группа/директ (поле `recipient`) | dispatch.go |
+| `message_update`, `message_delete` | правка/удаление своего сообщения (адрес `target` = nonce создания, `n` — fallback; delete также admin) | ingest.go |
+| `file` | E2EE-файл/голосовое (blob + envelope opaque, `recipient` как у сообщений; лимит шифротекста 8 MiB) | ingest.go |
+| `ack` | квитанция доставки пакетов (`{ids}`) | dispatch.go |
+| `alert`, `alert_ack`, `alert_clear` | тревоги SOS/СБОР/Инфо, подтверждение, отбой | dispatch.go |
+| `zone`, `zone_update`, `zone_delete` | зоны-полигоны | dispatch.go |
+| `revoke_subscriber`, `unrevoke_subscriber` | CRL-команды админа | import.go |
 
 ### Эфемерные сигнальные (релей, НЕ журналируются)
 | kind | Смысл |
 |---|---|
 | `hello` | аутентификация WS-сессии (не пишется) |
-| `call_invite`, `call_accept`, `call_reject`, `call_bye`, `ice` | сигналинг звонка 1:1 (relay.go:11-31) |
-| `ptt_start`, `ptt_end`, `ptt_talking`, `ptt_offer`, `ptt_answer`, `ptt_ice` | сигналинг рации (relay.go:36-51) |
+| `call_invite`, `call_accept`, `call_reject`, `call_bye`, `ice` | сигналинг звонка 1:1 (relay.go) |
+| `ptt_start`, `ptt_end`, `ptt_talking`, `ptt_offer`, `ptt_answer`, `ptt_ice` | сигналинг рации (relay.go) |
+| `typing`, `message_read` | «печатает» / прочтение (`{to, n}`) — только онлайн-пиру, без журнала и офлайн-очереди (relay.go `relayEphemeral`) |
 
 ## 3. E2EE-конвертное содержимое
 
@@ -54,11 +58,13 @@ store-and-forward и ретрансляция сигналов звонков/р
 
 | тип | что подменяется | источник |
 |---|---|---|
-| метка | `lat/lon=0`, `type="enc"`, `desc=enc` | ingest.go:30-33 |
-| обновление метки | `type/desc="enc"` | ingest.go:64-66 |
-| сообщение | `body=enc` | ingest.go:116-119 |
-| тревога | `atype/atext="enc"` (при этом whitelist-тип `sos/gather/info` пропускается) | ingest.go:159-164 |
-| зона | `name/color="enc"`, `points=enc`, проверка ≥3 точек пропускается | ingest.go:238-254 |
+| метка | `lat/lon=0`, `type="enc"`, `desc=enc` | ingest.go |
+| обновление метки | `type/desc="enc"` | ingest.go |
+| сообщение | `body=enc` | ingest.go |
+| правка сообщения | новое `body=enc` (адрес `target` открыт, как у меток) | ingest.go |
+| файл | `blob` (base64 шифротекста) + `enc` (v2-конверт ключа `{k,name,mime,size}`); имя/mime/размер открыты для маршрутизации, байты не вскрываются | ingest.go |
+| тревога | `atype/atext="enc"` (при этом whitelist-тип `sos/gather/info` пропускается) | ingest.go |
+| зона | `name/color="enc"`, `points=enc`, проверка ≥3 точек пропускается | ingest.go |
 
 Детектор — `encCargo(data)` (dispatch.go:88-99): ищет непустой `enc`, не глядя на
 его структуру. Так узел/БД держат только шифротексты, а «красивое» содержимое
@@ -162,8 +168,11 @@ write-timeout 10 с.
 - Все подписанные входящие события в журнале (`AddPacket`, store.go:524),
   флаг `delivered=0`.
 - При `hello` (после верификации подписи, hub.go:61-145):
-  1. `snapshot` — текущее состояние `markers/messages/alerts/zones/online`
-     (только то, что адресовано мне: `ListMessagesFor`, store.go:484-502);
+  1. `snapshot` — текущее состояние `markers/messages/files/alerts/zones/online`
+     (только то, что адресовано мне: `ListMessagesPaged`/`ListFilesFor`);
+     сообщений — только новейшие 300 (`SnapshotMessageCap`), файлы — метадатой
+     без blob (байты — `GET /api/v1/files?sender=&n=`); старое добирается
+     `GET /api/v1/messages?before_id=&limit=` (история, `ListMessagesPaged`);
   2. `packets {items}` — всё недоставленное: `UndeliveredPacketsFor(ctx, me)`.
 - Клиент, получив `packets`, собирает `ids` и шлёт подписанный `ack` →
   `handleAck` (ingest.go:131-139) → `MarkDelivered` (store.go:710-730).
@@ -182,11 +191,14 @@ write-timeout 10 с.
    `json.Marshal(f)` (relay.go:27-30). НЕ пере-подписывается и НЕ журналируется —
    эфимерно. Получатель сам верифицирует подпись автора.
 
-### Рация (`relayPTT`, relay.go:36-51)
-- `to` = один callsign или JSON-массив (`relayRecipients`, relay.go:55-69).
+### Рация (`relayPTT`, relay.go)
+- `to` = один callsign или JSON-массив (`relayRecipients`).
 - Релей через `h.deliver(b, recips, sender)` — каждый участник + автор; тоже
-  эфимерно, без журнала (relay.go:33-35).
-- `to` пуст → отказ (relay.go:40-41), PTT требует явного списка.
+  эфимерно, без журнала.
+- `to` пуст → отказ, PTT требует явного списка.
+- Клиент держит локальную очередь эфира (последние 5 говоривших) и свой журнал
+  вызовов (`frontend/src/call/log.ts`, localStorage `pp.calllog.<позывной>`,
+  кап 50): сервер звонки/PTT не журналирует сознательно, история — на аппарате.
 
 ### Безопасность релея
 - Сервер верифицирует подпись КАЖДОГО фрейма до маршрутизации (dispatch.go:21-25);

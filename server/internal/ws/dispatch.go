@@ -47,6 +47,20 @@ func (h *Hub) dispatch(ctx context.Context, c *client, data []byte) {
 		if _, err := h.IngestMessage(ctx, f); err != nil {
 			log.Printf("ws: message: %v", err)
 		}
+	case "message_update":
+		if _, err := h.IngestMessageUpdate(ctx, f); err != nil {
+			log.Printf("ws: message_update: %v", err)
+		}
+	case "message_delete":
+		if err := h.IngestMessageDelete(ctx, f, role); err != nil {
+			log.Printf("ws: message_delete: %v", err)
+		}
+	case "file":
+		if _, err := h.IngestFile(ctx, f); err != nil {
+			log.Printf("ws: file: %v", err)
+		}
+	case "typing", "message_read":
+		h.relayEphemeral(ctx, c, f)
 	case "ack":
 		h.handleAck(ctx, f)
 	case "alert":

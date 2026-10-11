@@ -305,3 +305,118 @@ func TestRecipientExactMatch(t *testing.T) {
 		t.Fatalf("b_b must see nothing (wildcard trap): %+v", msgsW)
 	}
 }
+
+func TestMessageEditDeleteCycle(t *testing.T) {
+	ctx := context.Background()
+	st, err := Open(t.TempDir(), testKey(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close(ctx)
+	if _, err := st.AddMessage(ctx, "alice", "bob", "v1", "e1"); err != nil {
+		t.Fatal(err)
+	}
+	m, err := st.MessageByNonce(ctx, "alice", "e1")
+	if err != nil || m.Body != "v1" || m.Edited != 0 {
+		t.Fatalf("lookup: %v %+v", err, m)
+	}
+	if _, err := st.MessageByNonce(ctx, "bob", "e1"); err != ErrNotFound {
+		t.Fatalf("per-sender addressing must miss, got %v", err)
+	}
+	if err := st.UpdateMessageBody(ctx, m.ID, "v2"); err != nil {
+		t.Fatal(err)
+	}
+	m2, err := st.MessageByNonce(ctx, "alice", "e1")
+	if err != nil || m2.Body != "v2" || m2.Edited != 1 {
+		t.Fatalf("after update: %v %+v", err, m2)
+	}
+	if err := st.DeleteMessage(ctx, m.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.MessageByNonce(ctx, "alice", "e1"); err != ErrNotFound {
+		t.Fatalf("row must be gone, got %v", err)
+	}
+}
+
+func TestFilesVisibility(t *testing.T) {
+	ctx := context.Background()
+	st, err := Open(t.TempDir(), testKey(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close(ctx)
+	if _, err := st.AddFile(ctx, "alice", "", "all.png", "image/png", 3, "QkxPQg==", `{"v":2}`, "f1"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.AddFile(ctx, "alice", "bob", "dm.png", "image/png", 3, "QkxPQg==", `{"v":2}`, "f2"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.AddFile(ctx, "alice", `["bob"]`, "g.png", "image/png", 3, "QkxPQg==", `{"v":2}`, "f3"); err != nil {
+		t.Fatal(err)
+	}
+	bob, err := st.ListFilesFor(ctx, "bob")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(bob) != 3 {
+		t.Fatalf("bob must see broadcast+direct+group: %+v", bob)
+	}
+	if bob[0].Blob != "" {
+		t.Fatalf("snapshot metadata must strip blobs: %+v", bob[0])
+	}
+	carol, err := st.ListFilesFor(ctx, "carol")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(carol) != 1 || carol[0].Nonce != "f1" {
+		t.Fatalf("carol must see only broadcast: %+v", carol)
+	}
+	f, err := st.FileByNonce(ctx, "alice", "f2")
+	if err != nil || f.Blob != "QkxPQg==" || f.Mime != "image/png" {
+		t.Fatalf("file lookup: %v %+v", err, f)
+	}
+	if _, err := st.FileByNonce(ctx, "alice", "nope"); err != ErrNotFound {
+		t.Fatalf("missing file must be ErrNotFound, got %v", err)
+	}
+}
+
+func TestMessagesPaged(t *testing.T) {
+	ctx := context.Background()
+	st, err := Open(t.TempDir(), testKey(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close(ctx)
+	for i, b := range []string{"one", "two", "three"} {
+		if _, err := st.AddMessage(ctx, "alice", "", b, "p"+string(rune('1'+i))); err != nil {
+			t.Fatal(err)
+		}
+	}
+	page, more, err := st.ListMessagesPaged(ctx, "bob", 0, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(page) != 2 || page[0].Body != "two" || page[1].Body != "three" || !more {
+		t.Fatalf("latest page: more=%v %+v", more, page)
+	}
+	page2, more2, err := st.ListMessagesPaged(ctx, "bob", page[0].ID, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(page2) != 1 || page2[0].Body != "one" || more2 {
+		t.Fatalf("older page: more=%v %+v", more2, page2)
+	}
+	// Direct message to someone else stays invisible in paging too.
+	if _, err := st.AddMessage(ctx, "alice", "carol", "secret", "px"); err != nil {
+		t.Fatal(err)
+	}
+	page3, _, err := st.ListMessagesPaged(ctx, "bob", 0, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, m := range page3 {
+		if m.Nonce == "px" {
+			t.Fatalf("bob must not page carol's message: %+v", page3)
+		}
+	}
+}

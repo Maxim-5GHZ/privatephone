@@ -56,7 +56,7 @@ func (s *Server) handleSnapshot(w http.ResponseWriter, r *http.Request, ev *prot
 		writeErr(w, http.StatusInternalServerError, "markers")
 		return
 	}
-	messages, err := s.st.ListMessagesFor(r.Context(), ev.Sender)
+	messages, more, err := s.st.ListMessagesPaged(r.Context(), ev.Sender, 0, snapshotMessageCap)
 	if err != nil {
 		writeErr(w, http.StatusInternalServerError, "messages")
 		return
@@ -75,11 +75,19 @@ func (s *Server) handleSnapshot(w http.ResponseWriter, r *http.Request, ev *prot
 	if err != nil {
 		chats = nil
 	}
+	files, err := s.st.ListFilesFor(r.Context(), ev.Sender)
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, "files")
+		return
+	}
 	if markers == nil {
 		markers = []db.Marker{}
 	}
 	if messages == nil {
 		messages = []db.Message{}
+	}
+	if files == nil {
+		files = []db.File{}
 	}
 	if alerts == nil {
 		alerts = []db.Alert{}
@@ -91,7 +99,7 @@ func (s *Server) handleSnapshot(w http.ResponseWriter, r *http.Request, ev *prot
 		chats = []db.Chat{}
 	}
 	writeJSON(w, http.StatusOK, ws.Snapshot{
-		Markers: markers, Messages: messages, Alerts: alerts, Zones: zones, Chats: chats, Online: s.hub.Online(),
+		Markers: markers, Messages: messages, MessagesMore: more, Files: files, Alerts: alerts, Zones: zones, Chats: chats, Online: s.hub.Online(),
 	})
 }
 
@@ -149,6 +157,31 @@ func (s *Server) handleSubmit(w http.ResponseWriter, r *http.Request, ev *protoc
 		rec, err := s.hub.IngestMessage(r.Context(), f)
 		if err != nil {
 			writeErr(w, http.StatusBadRequest, fmt.Sprintf("message rejected: %v", err))
+			return
+		}
+		writeJSON(w, http.StatusCreated, rec)
+	case "message_update":
+		rec, err := s.hub.IngestMessageUpdate(r.Context(), f)
+		if err != nil {
+			writeErr(w, http.StatusForbidden, fmt.Sprintf("message update rejected: %v", err))
+			return
+		}
+		writeJSON(w, http.StatusOK, rec)
+	case "message_delete":
+		role, err := s.ver.Role(r.Context(), ev.Sender)
+		if err != nil {
+			writeErr(w, http.StatusUnauthorized, "unknown sender")
+			return
+		}
+		if err := s.hub.IngestMessageDelete(r.Context(), f, role); err != nil {
+			writeErr(w, http.StatusForbidden, fmt.Sprintf("message delete rejected: %v", err))
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]bool{"deleted": true})
+	case "file":
+		rec, err := s.hub.IngestFile(r.Context(), f)
+		if err != nil {
+			writeErr(w, http.StatusBadRequest, fmt.Sprintf("file rejected: %v", err))
 			return
 		}
 		writeJSON(w, http.StatusCreated, rec)

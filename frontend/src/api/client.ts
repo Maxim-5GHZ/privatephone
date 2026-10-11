@@ -157,6 +157,43 @@ export async function fetchSnapshot(): Promise<Snapshot> {
   return snap
 }
 
+export interface HistoryPage {
+  messages: { id: number; sender: string; recipient: string; body: string; n: string; created_at: string; edited?: number }[]
+  more: boolean
+}
+
+export async function fetchHistory(beforeId: number, limit = 50): Promise<HistoryPage> {
+  const q = `?limit=${limit}${beforeId > 0 ? `&before_id=${beforeId}` : ''}`
+  return (await apiGet(`/api/v1/messages${q}`, 'history')) as HistoryPage
+}
+
+export async function fetchFile(sender: string, n: string): Promise<{
+  id: number
+  sender: string
+  recipient: string
+  name: string
+  mime: string
+  size: number
+  blob: string
+  enc: string
+  n: string
+  created_at: string
+}> {
+  const q = `?sender=${encodeURIComponent(sender)}&n=${encodeURIComponent(n)}`
+  return (await apiGet(`/api/v1/files${q}`, 'file_get')) as {
+    id: number
+    sender: string
+    recipient: string
+    name: string
+    mime: string
+    size: number
+    blob: string
+    enc: string
+    n: string
+    created_at: string
+  }
+}
+
 // --- Named chats (admin creates, members read/write) ---
 
 export interface ChatDTO {

@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"strings"
 
 	"privatephone/server/internal/db"
 	"privatephone/server/internal/protocol"
@@ -157,6 +158,145 @@ func (h *Hub) handleAck(ctx context.Context, f protocol.Frame) {
 		return
 	}
 	_ = h.st.MarkDelivered(ctx, a.IDs, f.Sender)
+}
+
+// IngestMessageUpdate replaces the body of a message the sender authored.
+// The target message is addressed by `target` (the nonce stored at creation);
+// `n` is a fallback for plaintext clients. E2EE updates carry the new body as
+// an opaque envelope, exactly like IngestMessage.
+func (h *Hub) IngestMessageUpdate(ctx context.Context, f protocol.Frame) (db.Message, error) {
+	var m struct {
+		Target string          `json:"target"`
+		Body   string          `json:"body"`
+		N      string          `json:"n"`
+		Enc    json.RawMessage `json:"enc"`
+	}
+	var rec db.Message
+	if err := json.Unmarshal(f.Data, &m); err != nil {
+		return rec, err
+	}
+	tn := m.Target
+	if tn == "" {
+		tn = m.N
+	}
+	cur, err := h.st.MessageByNonce(ctx, f.Sender, tn)
+	if err != nil {
+		return rec, err
+	}
+	body := m.Body
+	if enc, ok := encCargo(f.Data); ok {
+		body = enc
+	}
+	if body == "" {
+		return rec, errors.New("empty body")
+	}
+	if err := h.st.UpdateMessageBody(ctx, cur.ID, body); err != nil {
+		return rec, err
+	}
+	rec = cur
+	rec.Body = body
+	rec.Edited = 1
+	h.journal(ctx, f, cur.Recipient)
+	b, _ := json.Marshal(out{Kind: "message_updated", Data: rec})
+	recips, _ := h.expandMessageRecipients(ctx, cur.Recipient)
+	h.deliver(b, recips, f.Sender)
+	return rec, nil
+}
+
+// IngestMessageDelete removes a message (author or admin). The signed delete
+// packet stays in the journal for audit, like marker deletes.
+func (h *Hub) IngestMessageDelete(ctx context.Context, f protocol.Frame, role string) error {
+	var m struct {
+		Target string `json:"target"`
+		N      string `json:"n"`
+	}
+	if err := json.Unmarshal(f.Data, &m); err != nil {
+		return err
+	}
+	tn := m.Target
+	if tn == "" {
+		tn = m.N
+	}
+	cur, err := h.st.MessageByNonce(ctx, f.Sender, tn)
+	if err != nil {
+		return err
+	}
+	if cur.Sender != f.Sender && role != "admin" {
+		return errors.New("not the author")
+	}
+	if err := h.st.DeleteMessage(ctx, cur.ID); err != nil {
+		return err
+	}
+	h.journal(ctx, f, cur.Recipient)
+	h.broadcastJSON(out{Kind: "message_deleted", Data: map[string]any{"sender": cur.Sender, "n": cur.Nonce, "id": cur.ID}})
+	return nil
+}
+
+// fileBlobMaxBytes caps one E2EE file (decoded ciphertext): photos and voice
+// notes fit, the journal stays replicable over sneaker-net.
+const fileBlobMaxBytes = 8 << 20 // 8 MiB
+
+// IngestFile stores one E2EE file/voice attachment opaque (blob + key
+// envelope) and routes it like a message ("" = broadcast, callsign / JSON
+// array / "chat:<id>" = addressed). Plaintext metadata (name/mime/size) is
+// validated; the bytes themselves are never inspected.
+func (h *Hub) IngestFile(ctx context.Context, f protocol.Frame) (db.File, error) {
+	var m struct {
+		Recipient string          `json:"recipient"`
+		Name      string          `json:"name"`
+		Mime      string          `json:"mime"`
+		Size      int64           `json:"size"`
+		Blob      string          `json:"blob"`
+		N         string          `json:"n"`
+		Enc       json.RawMessage `json:"enc"`
+	}
+	var rec db.File
+	if err := json.Unmarshal(f.Data, &m); err != nil {
+		return rec, err
+	}
+	if len(m.Recipient) > 5 && m.Recipient[:5] == "chat:" {
+		ok, err := h.isChatMember(ctx, f.Sender, m.Recipient)
+		if err != nil || !ok {
+			if err == nil {
+				err = errors.New("not a chat member")
+			}
+			return rec, err
+		}
+	}
+	enc, ok := encCargo(f.Data)
+	if !ok {
+		return rec, errors.New("file must carry E2EE envelope")
+	}
+	if m.Blob == "" {
+		return rec, errors.New("empty file")
+	}
+	if int64(len(m.Blob)) > fileBlobMaxBytes*4/3+4096 {
+		return rec, errors.New("file too large")
+	}
+	name := m.Name
+	if name == "" {
+		name = "файл"
+	}
+	if len(name) > 128 {
+		name = name[:128]
+	}
+	mime := m.Mime
+	if mime == "" {
+		mime = "application/octet-stream"
+	}
+	if len(mime) > 64 || !strings.Contains(mime, "/") {
+		return rec, errors.New("bad mime")
+	}
+	id, err := h.st.AddFile(ctx, f.Sender, m.Recipient, name, mime, m.Size, m.Blob, enc, m.N)
+	if err != nil {
+		return rec, err
+	}
+	rec = db.File{ID: id, Sender: f.Sender, Recipient: m.Recipient, Name: name, Mime: mime, Size: m.Size, Blob: m.Blob, Enc: enc, Nonce: m.N, Created: now()}
+	h.journal(ctx, f, m.Recipient)
+	b, _ := json.Marshal(out{Kind: "file", Data: rec})
+	recips, _ := h.expandMessageRecipients(ctx, m.Recipient)
+	h.deliver(b, recips, f.Sender)
+	return rec, nil
 }
 
 var alertTypes = map[string]bool{"sos": true, "gather": true, "info": true}

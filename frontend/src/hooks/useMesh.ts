@@ -6,15 +6,18 @@ import {
   createChat as apiCreateChat,
   deleteChat as apiDeleteChat,
   fetchChats,
+  fetchFile,
+  fetchHistory,
   revokeSubscriber,
   updateChat as apiUpdateChat,
   WSHandle,
 } from '../api/client'
 import { encId, recipientList } from '../crypto/content'
 import { encrypt, getEcdhKey, looksLikeEnvelope } from '../crypto/e2ee'
+import { b64encode, parseFileKey, sealFile } from '../crypto/filebox'
 import { logout, signPacket } from '../crypto/signing'
 import { clearDecryptCache, DecryptItem, useDecrypted } from '../crypto/useDecrypt'
-import { Alert, Chat, MARKER_LABEL, Marker, Message, Packet, Subscriber, Snapshot, WSMsg, Zone } from '../types'
+import { Alert, Chat, FileMeta, MARKER_LABEL, Marker, Message, Packet, Subscriber, Snapshot, WSMsg, Zone } from '../types'
 import type { SignalFn } from './useRtc'
 
 const nonce = () => Math.random().toString(36).slice(2)
@@ -35,6 +38,18 @@ function upsertMessage(list: Message[], m: Message): Message[] {
   const arr = list ?? []
   if (arr.some((x) => x.sender === m.sender && x.n === m.n && m.n !== '')) return arr
   return [...arr, m]
+}
+
+function removeMessage(list: Message[], sender: string, n: string): Message[] {
+  return (list ?? []).filter((x) => !(x.sender === sender && x.n === n))
+}
+
+function upsertFile(list: FileMeta[], f: FileMeta): FileMeta[] {
+  const arr = list ?? []
+  if (arr.some((x) => x.sender === f.sender && x.n === f.n && f.n !== '')) {
+    return arr.map((x) => (x.sender === f.sender && x.n === f.n ? { ...f, blob: f.blob || x.blob } : x))
+  }
+  return [...arr, f]
 }
 
 function upsertAlert(list: Alert[], a: Alert): Alert[] {
@@ -94,6 +109,27 @@ function packetToMessage(p: Packet): Message | null {
   }
 }
 
+function packetToFile(p: Packet): FileMeta | null {
+  try {
+    const d = JSON.parse(p.payload) as { recipient?: string; name?: string; mime?: string; size?: number; blob?: string; enc?: unknown }
+    if (!d.enc || typeof d.blob !== 'string' || !d.blob) return null
+    return {
+      id: -p.ts,
+      sender: p.sender,
+      recipient: d.recipient ?? '',
+      name: typeof d.name === 'string' ? d.name : 'файл',
+      mime: typeof d.mime === 'string' ? d.mime : 'application/octet-stream',
+      size: typeof d.size === 'number' ? d.size : 0,
+      blob: d.blob,
+      enc: JSON.stringify(d.enc),
+      n: p.nonce,
+      created_at: '',
+    }
+  } catch {
+    return null
+  }
+}
+
 function packetToAlert(p: Packet): Alert | null {
   try {
     const d = JSON.parse(p.payload) as { type?: string; text?: string; enc?: unknown }
@@ -138,9 +174,23 @@ export interface MeshApi {
   hydratedMessages: Message[]
   hydratedZones: Zone[]
   hydratedAlerts: Alert[]
+  files: FileMeta[]
+  hydratedFiles: FileMeta[]
+  messagesMore: boolean
+  /** peer -> typing expiry (Date.now()+ms); presence-gated hint, not delivery */
+  typing: Map<string, number>
+  /** "author/nonce" -> readers; read receipts for own messages */
+  reads: Map<string, string[]>
   setNotice: (msg: string | null) => void
   isAdmin: boolean
-  sendMessage: (body: string, recipient: string) => void
+  sendMessage: (body: string, recipient: string) => Promise<boolean>
+  updateMessage: (m: Message, body: string) => Promise<boolean>
+  deleteMessage: (m: Message) => Promise<boolean>
+  sendFile: (name: string, mime: string, data: Uint8Array, recipient: string) => Promise<boolean>
+  ensureFileBlob: (f: FileMeta) => Promise<FileMeta | null>
+  loadHistory: () => Promise<boolean>
+  sendTyping: (to: string) => void
+  sendRead: (to: string, n: string) => void
   sendMarker: (m: { lat: number; lon: number; type: string; desc: string }) => void
   updateMarker: (m: Marker, type: string, desc: string) => void
   deleteMarker: (m: Marker) => void
@@ -176,6 +226,10 @@ export function useMesh({ callsign, wsRef, pubsRef, signalRef }: MeshOptions): M
   const [notice, setNotice] = useState<string | null>(null)
   const [toasts, setToasts] = useState<{ id: number; text: string }[]>([])
   const [decryptSession, setDecryptSession] = useState(0)
+  const [files, setFiles] = useState<FileMeta[]>([])
+  const [messagesMore, setMessagesMore] = useState(false)
+  const [typing, setTyping] = useState<Map<string, number>>(new Map())
+  const [reads, setReads] = useState<Map<string, string[]>>(new Map())
   const toastId = useRef(0)
 
   const pubs = useMemo(() => {
@@ -194,8 +248,9 @@ export function useMesh({ callsign, wsRef, pubsRef, signalRef }: MeshOptions): M
     for (const a of alerts) if (a.type === 'enc') items.push({ id: encId('al', a.sender, a.text ?? ''), sender: a.sender, text: a.text ?? '', pubPEM: pubs.get(a.sender) ?? '' })
     for (const z of zones) if (z.name === 'enc') items.push({ id: encId('zn', z.sender, z.points || ''), sender: z.sender, text: z.points || '', pubPEM: pubs.get(z.sender) ?? '' })
     for (const m of messages) if (looksLikeEnvelope(m.body)) items.push({ id: encId('ms', m.sender, m.body), sender: m.sender, text: m.body, pubPEM: pubs.get(m.sender) ?? '' })
+    for (const f of files) if (f.enc && looksLikeEnvelope(f.enc)) items.push({ id: encId('fl', f.sender, f.enc), sender: f.sender, text: f.enc, pubPEM: pubs.get(f.sender) ?? '' })
     return items
-  }, [markers, alerts, zones, messages, pubs])
+  }, [markers, alerts, zones, messages, files, pubs])
   const decrypted = useDecrypted(decryptItems, decryptSession)
 
   const hydratedMarkers = useMemo(() => {
@@ -224,6 +279,17 @@ export function useMesh({ callsign, wsRef, pubsRef, signalRef }: MeshOptions): M
       return { ...m, body: decrypted.get(encId('ms', m.sender, m.body)) ?? '[зашифровано]' }
     })
   }, [messages, decrypted])
+
+  // hydratedFiles resolves each file's fileKey from its e2ee envelope (the
+  // bytes themselves stay sealed until the user opens the attachment).
+  const hydratedFiles = useMemo(() => {
+    return files.map((f) => {
+      if (!f.enc || !looksLikeEnvelope(f.enc)) return { ...f, fileKey: null }
+      const plain = decrypted.get(encId('fl', f.sender, f.enc))
+      if (!plain) return { ...f, fileKey: null }
+      return { ...f, fileKey: parseFileKey(plain)?.k ?? null }
+    })
+  }, [files, decrypted])
 
   const hydratedZones = useMemo(() => {
     const out: Zone[] = []
@@ -282,6 +348,8 @@ export function useMesh({ callsign, wsRef, pubsRef, signalRef }: MeshOptions): M
           const s = m.data as Snapshot
           setMarkers(s.markers ?? [])
           setMessages(s.messages ?? [])
+          setMessagesMore(!!s.messages_more)
+          setFiles(s.files ?? [])
           setAlerts(s.alerts ?? [])
           setZones(s.zones ?? [])
           setChats(s.chats ?? [])
@@ -293,6 +361,7 @@ export function useMesh({ callsign, wsRef, pubsRef, signalRef }: MeshOptions): M
           const ids: string[] = []
           let newMarkers: Marker[] = []
           let newMessages: Message[] = []
+          let newFiles: FileMeta[] = []
           let newAlerts: Alert[] = []
           let newZones: Zone[] = []
           for (const p of items) {
@@ -303,6 +372,30 @@ export function useMesh({ callsign, wsRef, pubsRef, signalRef }: MeshOptions): M
             } else if (p.kind === 'message') {
               const mm = packetToMessage(p)
               if (mm) newMessages = upsertMessage(newMessages, mm)
+            } else if (p.kind === 'message_update') {
+              try {
+                const d = JSON.parse(p.payload) as { n?: string; target?: string; body?: string; enc?: unknown }
+                const tn = d.target ?? d.n ?? ''
+                const body = d.enc ? JSON.stringify(d.enc) : (d.body ?? '')
+                if (tn && body) {
+                  setMessages((prev) =>
+                    prev.map((x) => (x.sender === p.sender && x.n === tn ? { ...x, body, edited: 1 } : x)),
+                  )
+                }
+              } catch {
+                /* ignore */
+              }
+            } else if (p.kind === 'message_delete') {
+              try {
+                const d = JSON.parse(p.payload) as { n?: string; target?: string }
+                const tn = d.target ?? d.n ?? ''
+                if (tn) setMessages((prev) => removeMessage(prev, p.sender, tn))
+              } catch {
+                /* ignore */
+              }
+            } else if (p.kind === 'file') {
+              const ff = packetToFile(p)
+              if (ff) newFiles = upsertFile(newFiles, ff)
             } else if (p.kind === 'alert') {
               const aa = packetToAlert(p)
               if (aa) newAlerts = upsertAlert(newAlerts, aa)
@@ -349,6 +442,7 @@ export function useMesh({ callsign, wsRef, pubsRef, signalRef }: MeshOptions): M
           }
           if (newMarkers.length) setMarkers((prev) => prev.concat(newMarkers.filter((x) => !prev.some((y) => y.sender === x.sender && y.n === x.n))))
           if (newMessages.length) setMessages((prev) => prev.concat(newMessages.filter((x) => !prev.some((y) => y.sender === x.sender && y.n === x.n))))
+          if (newFiles.length) setFiles((prev) => prev.concat(newFiles.filter((x) => !prev.some((y) => y.sender === x.sender && y.n === x.n))))
           if (newAlerts.length) setAlerts((prev) => prev.concat(newAlerts.filter((x) => !prev.some((y) => y.sender === x.sender && y.n === x.n))))
           if (newZones.length) setZones((prev) => prev.concat(newZones.filter((x) => !prev.some((y) => y.sender === x.sender && y.n === x.n))))
           void signPacket('ack', { ids }).then((p) => wsRef.current?.send(p)).catch(() => {})
@@ -372,6 +466,47 @@ export function useMesh({ callsign, wsRef, pubsRef, signalRef }: MeshOptions): M
         case 'message':
           setMessages((prev) => upsertMessage(prev, m.data as Message))
           break
+        case 'message_updated': {
+          const u = m.data as Message
+          setMessages((prev) => {
+            if (prev.some((x) => x.sender === u.sender && x.n === u.n)) {
+              return prev.map((x) => (x.sender === u.sender && x.n === u.n ? u : x))
+            }
+            return [...prev, u]
+          })
+          break
+        }
+        case 'message_deleted': {
+          const d = m.data as { sender: string; n: string }
+          setMessages((prev) => removeMessage(prev, d.sender, d.n))
+          break
+        }
+        case 'file': {
+          const f = m.data as FileMeta
+          setFiles((prev) => upsertFile(prev, f))
+          addToast(`${f.sender}: файл «${f.name}»`)
+          break
+        }
+        case 'typing': {
+          const from = (m as { sender?: string }).sender ?? ''
+          if (from) {
+            setTyping((prev) => new Map(prev).set(from, Date.now() + 4000))
+          }
+          break
+        }
+        case 'message_read': {
+          const reader = (m as { sender?: string }).sender ?? ''
+          const d = m.data as { to?: string; n?: string }
+          if (reader && d.to && d.n) {
+            const key = `${d.to}/${d.n}`
+            setReads((prev) => {
+              const cur = prev.get(key) ?? []
+              if (cur.includes(reader)) return prev
+              return new Map(prev).set(key, [...cur, reader])
+            })
+          }
+          break
+        }
         case 'alert':
           setAlerts((prev) => upsertAlert(prev, m.data as Alert))
           addToast(`Тревога: ${(m.data as Alert).sender}`)
@@ -438,6 +573,8 @@ export function useMesh({ callsign, wsRef, pubsRef, signalRef }: MeshOptions): M
           break
         case 'call_error':
           setNotice(`Не удалось позвонить ${(m.data as { to: string }).to}: ${(m.data as { error?: string }).error ?? 'недоступен'}`)
+          // Forward to the RTC layer so the attempt lands in local call history.
+          signalRef.current?.('call_error', '', (m.data ?? {}) as Record<string, unknown>)
           break
       }
     },
@@ -493,16 +630,109 @@ export function useMesh({ callsign, wsRef, pubsRef, signalRef }: MeshOptions): M
     return apiPost(path, kind, { n: nonce(), recipient, enc: env, ...outer })
   }
 
-  const sendMessage = async (body: string, recipient: string) => {
-    if (!callsign) return
+  const sendMessage = async (body: string, recipient: string): Promise<boolean> => {
+    if (!callsign) return false
     try {
       const rec = (await sendEnc('message', '/api/v1/messages', { body }, recipient)) as Message
       setMessages((prev) => upsertMessage(prev, rec))
+      return true
     } catch (e) {
       setNotice((e as Error).message)
+      return false
     }
   }
 
+  const updateMessage = async (msg: Message, body: string): Promise<boolean> => {
+    if (!callsign) return false
+    try {
+      const rec = (await sendEnc('message_update', '/api/v1/messages', { body }, '', { target: msg.n })) as Message
+      setMessages((prev) => prev.map((x) => (x.sender === rec.sender && x.n === rec.n ? rec : x)))
+      return true
+    } catch (e) {
+      setNotice((e as Error).message)
+      return false
+    }
+  }
+
+  const deleteMessage = async (msg: Message): Promise<boolean> => {
+    if (!callsign) return false
+    try {
+      await apiPost('/api/v1/messages', 'message_delete', { target: msg.n })
+      setMessages((prev) => removeMessage(prev, msg.sender, msg.n))
+      return true
+    } catch (e) {
+      setNotice((e as Error).message)
+      return false
+    }
+  }
+
+  const sendFile = async (name: string, mime: string, data: Uint8Array, recipient: string): Promise<boolean> => {
+    if (!callsign) return false
+    try {
+      if (data.length > 8 * 1024 * 1024) throw new Error('Файл больше 8 МБ — сожмите перед отправкой')
+      const sealed = await sealFile(data)
+      const blob = b64encode(sealed.raw)
+      const k = b64encode(sealed.fileKey)
+      const rec = (await sendEnc(
+        'file',
+        '/api/v1/files',
+        { k, name, mime, size: data.length },
+        recipient,
+        { blob, name, mime, size: data.length },
+      )) as FileMeta
+      setFiles((prev) => upsertFile(prev, rec))
+      return true
+    } catch (e) {
+      setNotice((e as Error).message)
+      return false
+    }
+  }
+
+  // ensureFileBlob loads the sealed bytes for a metadata-only row (snapshot
+  // rows skip the blob) and merges them into state.
+  const ensureFileBlob = async (f: FileMeta): Promise<FileMeta | null> => {
+    if (f.blob) return f
+    try {
+      const full = (await fetchFile(f.sender, f.n)) as FileMeta
+      setFiles((prev) => upsertFile(prev, full))
+      return full
+    } catch (e) {
+      setNotice((e as Error).message)
+      return null
+    }
+  }
+
+  // loadHistory prepends the next older page of visible messages.
+  const loadHistory = async (): Promise<boolean> => {
+    const before = messages.length ? Math.min(...messages.map((m) => m.id)) : 0
+    try {
+      const page = await fetchHistory(before, 50)
+      setMessages((prev) => {
+        const known = new Set(prev.map((m) => `${m.sender}|${m.n}`))
+        const older = page.messages.filter((m) => !known.has(`${m.sender}|${m.n}`))
+        return [...older, ...prev]
+      })
+      setMessagesMore(page.more)
+      return page.more
+    } catch (e) {
+      setNotice((e as Error).message)
+      return messagesMore
+    }
+  }
+
+  const sendTyping = (to: string) => {
+    if (!to) return
+    void signPacket('typing', { to })
+      .then((p) => wsRef.current?.send(p))
+      .catch(() => {})
+  }
+
+  const sendRead = (to: string, n: string) => {
+    if (!to || !n) return
+    void signPacket('message_read', { to, n })
+      .then((p) => wsRef.current?.send(p))
+      .catch(() => {})
+  }
   const sendMarker = async (m: { lat: number; lon: number; type: string; desc: string }) => {
     try {
       const rec = (await sendEnc('marker', '/api/v1/markers', m)) as Marker
@@ -627,6 +857,10 @@ export function useMesh({ callsign, wsRef, pubsRef, signalRef }: MeshOptions): M
     setDecryptSession((s) => s + 1)
     setMarkers([])
     setMessages([])
+    setMessagesMore(false)
+    setFiles([])
+    setTyping(new Map())
+    setReads(new Map())
     setAlerts([])
     setZones([])
     setChats([])
@@ -691,9 +925,21 @@ export function useMesh({ callsign, wsRef, pubsRef, signalRef }: MeshOptions): M
     hydratedMessages,
     hydratedZones,
     hydratedAlerts,
+    files,
+    hydratedFiles,
+    messagesMore,
+    typing,
+    reads,
     setNotice,
     isAdmin,
     sendMessage,
+    updateMessage,
+    deleteMessage,
+    sendFile,
+    ensureFileBlob,
+    loadHistory,
+    sendTyping,
+    sendRead,
     sendMarker,
     updateMarker,
     deleteMarker,

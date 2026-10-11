@@ -119,7 +119,7 @@ func (h *Hub) pushBacklog(ctx context.Context, c *client) {
 	if err != nil {
 		return
 	}
-	messages, err := h.st.ListMessagesFor(ctx, me)
+	messages, more, err := h.st.ListMessagesPaged(ctx, me, 0, SnapshotMessageCap)
 	if err != nil {
 		return
 	}
@@ -135,11 +135,18 @@ func (h *Hub) pushBacklog(ctx context.Context, c *client) {
 	if err != nil {
 		chats = nil
 	}
+	files, err := h.st.ListFilesFor(ctx, me)
+	if err != nil {
+		files = nil
+	}
 	if markers == nil {
 		markers = []db.Marker{}
 	}
 	if messages == nil {
 		messages = []db.Message{}
+	}
+	if files == nil {
+		files = []db.File{}
 	}
 	if alerts == nil {
 		alerts = []db.Alert{}
@@ -150,7 +157,7 @@ func (h *Hub) pushBacklog(ctx context.Context, c *client) {
 	if chats == nil {
 		chats = []db.Chat{}
 	}
-	snap := outSnap{Kind: "snapshot", Data: Snapshot{Markers: markers, Messages: messages, Alerts: alerts, Zones: zones, Chats: chats, Online: h.Online()}}
+	snap := outSnap{Kind: "snapshot", Data: Snapshot{Markers: markers, Messages: messages, MessagesMore: more, Files: files, Alerts: alerts, Zones: zones, Chats: chats, Online: h.Online()}}
 	if b, err := json.Marshal(snap); err == nil {
 		c.enqueue(b)
 	}

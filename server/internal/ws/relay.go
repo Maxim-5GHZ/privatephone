@@ -50,6 +50,25 @@ func (h *Hub) relayPTT(ctx context.Context, c *client, f protocol.Frame) {
 	}
 }
 
+// relayEphemeral forwards typing indicators and read receipts (`to` = single
+// callsign) to the addressed online peer. Unjournaled and offline-blind, like
+// call signaling: presence-gated UX hints, not delivery guarantees.
+func (h *Hub) relayEphemeral(ctx context.Context, c *client, f protocol.Frame) {
+	var m struct {
+		To string `json:"to"`
+	}
+	if err := json.Unmarshal(f.Data, &m); err != nil || m.To == "" {
+		return
+	}
+	target := h.findClient(m.To)
+	if target == nil {
+		return
+	}
+	b, _ := json.Marshal(f)
+	if b != nil {
+		target.enqueue(b)
+	}
+}
 // relayRecipients expands a `to` field that is either a single callsign or a
 // JSON array of callsigns into the recipient list.
 func relayRecipients(to json.RawMessage) []string {

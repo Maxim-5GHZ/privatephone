@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useRef, useState, type Dispatch, type RefObject, type SetStateAction } from 'react'
 import { WSHandle } from '../api/client'
+import { appendCallLog, CallLogEntry, clearCallLog, loadCallLog, pushTalker, TalkMark } from '../call/log'
 import { CallController } from '../call/webRTC'
 import { PttController } from '../ptt/ptt'
 import { CallState } from '../types'
@@ -19,6 +20,11 @@ export interface RtcApi {
   pttTalker: string | null
   pttTalking: boolean
   pttStreams: Map<string, MediaStream>
+  /** recent PTT talkers, newest last (local UI queue, not server state) */
+  pttRecent: TalkMark[]
+  /** local call history (server relay is ephemeral, see call/log.ts) */
+  callLog: CallLogEntry[]
+  clearHistory: () => void
   setPttOpen: Dispatch<SetStateAction<boolean>>
   startPtt: (targets: string[]) => void
   keyPtt: (on: boolean) => void
@@ -51,13 +57,31 @@ export function useRtc({ callsign, wsRef, pubsRef, onError }: RtcOptions): RtcAp
   const [pttTalker, setPttTalker] = useState<string | null>(null)
   const [pttTalking, setPttTalking] = useState(false)
   const [pttStreams, setPttStreams] = useState<Map<string, MediaStream>>(new Map())
+  const [pttRecent, setPttRecent] = useState<TalkMark[]>([])
+  const [callLog, setCallLog] = useState<CallLogEntry[]>([])
 
   const contRef = useRef<CallController | null>(null)
   const pttRef = useRef<PttController | null>(null)
   const onErrorRef = useRef(onError)
+  const meRef = useRef(callsign)
+  meRef.current = callsign
+  const callRef = useRef(call)
+  callRef.current = call
   useEffect(() => {
     onErrorRef.current = onError
   }, [onError])
+
+  // Load per-callsign history on login; reset clears it from the screen.
+  useEffect(() => {
+    setCallLog(callsign ? loadCallLog(callsign) : [])
+    setPttRecent([])
+  }, [callsign])
+
+  const log = useCallback((entry: CallLogEntry) => {
+    const me = meRef.current
+    if (!me) return
+    setCallLog(appendCallLog(me, entry))
+  }, [])
 
   useEffect(() => {
     if (!callsign) return
@@ -66,7 +90,11 @@ export function useRtc({ callsign, wsRef, pubsRef, onError }: RtcOptions): RtcAp
       send: (p) => wsRef.current?.send(p),
       onState: (state: CallState) => setCall((prev) => ({ ...prev, state })),
       onRemote: (stream) => setRemote(stream),
-      onIncoming: (peer) => setCall((prev) => ({ ...prev, incoming: true, peer })),
+      onIncoming: (peer) => {
+        setCall((prev) => ({ ...prev, incoming: true, peer }))
+        const me = meRef.current
+        if (me) setCallLog(appendCallLog(me, { peer, dir: 'in', result: 'ringing', at: Date.now() }))
+      },
       onError: (msg) => onErrorRef.current(msg),
       onLink: (secure) => setCallSecure(secure),
       myPub: () => pubsRef.current.get(callsign) ?? '',
@@ -77,9 +105,15 @@ export function useRtc({ callsign, wsRef, pubsRef, onError }: RtcOptions): RtcAp
       callsign,
       onSession: (members) => {
         setPttSession(members.length ? members : null)
-        if (!members.length) setPttTalking(false)
+        if (!members.length) {
+          setPttTalking(false)
+          setPttRecent([])
+        }
       },
-      onTalking: (from) => setPttTalker(from),
+      onTalking: (from) => {
+        setPttTalker(from)
+        if (from) setPttRecent((prev) => pushTalker(prev, from))
+      },
       onStream: (peer, stream) => {
         setPttStreams((prev) => {
           const next = new Map(prev)
@@ -106,9 +140,23 @@ export function useRtc({ callsign, wsRef, pubsRef, onError }: RtcOptions): RtcAp
   }, [callsign, wsRef, pubsRef])
 
   const handleSignal = useCallback<SignalFn>((kind, sender, data) => {
+    // Server-side call_error (offline peer) is consumed for history here;
+    // the user-facing notice stays in useMesh.
+    if (kind === 'call_error') {
+      const to = typeof data?.to === 'string' ? (data.to as string) : ''
+      if (to) log({ peer: to, dir: 'out', result: 'offline', at: Date.now() })
+      return
+    }
+    // Caller hung up while we were ringing → missed incoming.
+    if (kind === 'call_bye') {
+      const cur = callRef.current
+      if (cur.incoming && cur.peer && (!sender || sender === cur.peer)) {
+        log({ peer: cur.peer, dir: 'in', result: 'missed', at: Date.now() })
+      }
+    }
     if (kind.startsWith('ptt_')) pttRef.current?.onPeerFrame(kind, sender, data)
     else contRef.current?.onPeerFrame(kind, sender, data)
-  }, [])
+  }, [log])
 
   const startPtt = useCallback((targets: string[]) => {
     setPttOpen(true)
@@ -127,24 +175,42 @@ export function useRtc({ callsign, wsRef, pubsRef, onError }: RtcOptions): RtcAp
   const startCall = useCallback((target: string) => {
     if (contRef.current) {
       setCall({ state: 'calling', peer: target, incoming: false, error: null })
+      log({ peer: target, dir: 'out', result: 'calling', at: Date.now() })
       void contRef.current.start(target)
     }
-  }, [])
+  }, [log])
 
   const acceptCall = useCallback(() => {
-    setCall((prev) => ({ ...prev, incoming: false }))
+    setCall((prev) => {
+      if (prev.peer) log({ peer: prev.peer, dir: 'in', result: 'accepted', at: Date.now() })
+      return { ...prev, incoming: false }
+    })
     void contRef.current?.accept()
-  }, [])
+  }, [log])
 
   const rejectCall = useCallback(() => {
+    setCall((prev) => {
+      if (prev.peer) log({ peer: prev.peer, dir: 'in', result: 'rejected', at: Date.now() })
+      return { ...prev, incoming: false }
+    })
     contRef.current?.reject()
-    setCall((prev) => ({ ...prev, incoming: false }))
-  }, [])
+  }, [log])
 
   const hangupCall = useCallback(() => {
+    setCall((prev) => {
+      if (prev.peer && (prev.state === 'in-call' || prev.state === 'connecting' || prev.state === 'calling')) {
+        log({ peer: prev.peer, dir: prev.incoming ? 'in' : 'out', result: 'ended', at: Date.now() })
+      }
+      return { ...prev, incoming: false, error: null }
+    })
     contRef.current?.hangup()
-    setCall((prev) => ({ ...prev, incoming: false, error: null }))
     setRemote(null)
+  }, [log])
+
+  const clearHistory = useCallback(() => {
+    const me = meRef.current
+    if (me) clearCallLog(me)
+    setCallLog([])
   }, [])
 
   const reset = useCallback(() => {
@@ -161,6 +227,8 @@ export function useRtc({ callsign, wsRef, pubsRef, onError }: RtcOptions): RtcAp
     setPttTalker(null)
     setPttTalking(false)
     setPttStreams(new Map())
+    setPttRecent([])
+    setCallLog([])
   }, [])
 
   return {
@@ -173,6 +241,9 @@ export function useRtc({ callsign, wsRef, pubsRef, onError }: RtcOptions): RtcAp
     pttTalker,
     pttTalking,
     pttStreams,
+    pttRecent,
+    callLog,
+    clearHistory,
     setPttOpen,
     startPtt,
     keyPtt,

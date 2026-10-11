@@ -39,22 +39,34 @@ export default function App() {
 
   if (!callsign) return <Login onLogin={setCallsign} />
 
+  // Sidebar badges: unread = messages from others, sos = active alerts,
+  // talking = active PTT session. Admin entry is admin-only.
+  const unread = mesh.hydratedMessages.filter((m) => m.sender !== callsign).length
+  const sosCount = mesh.hydratedAlerts.length
+  const talking = rtc.pttTalking || rtc.pttTalker !== null
+
   return (
     <div className="app">
       <header>
         <div className="brand">ПАК АСК</div>
-        <nav>
+        <nav aria-label="Основная навигация">
           <button className={tab === 'map' ? 'active' : ''} onClick={() => setTab('map')}>
-            Карта
+            Карта{sosCount > 0 && <span className="nav-badge danger">{sosCount}</span>}
           </button>
           <button className={tab === 'chat' ? 'active' : ''} onClick={() => setTab('chat')}>
-            Сообщения
+            Сообщения{unread > 0 && <span className="nav-badge">{unread > 99 ? '99+' : unread}</span>}
           </button>
-          <button className={tab === 'admin' ? 'active' : ''} onClick={() => setTab('admin')}>
-            Админ
-          </button>
-          <button className={rtc.pttOpen ? 'active' : ''} onClick={() => rtc.setPttOpen((v) => !v)}>
-            Рация
+          {mesh.isAdmin && (
+            <button className={tab === 'admin' ? 'active' : ''} onClick={() => setTab('admin')} title="Панель оператора">
+              ⚙ Админ
+            </button>
+          )}
+          <button
+            className={rtc.pttOpen ? 'active' : ''}
+            onClick={() => rtc.setPttOpen((v) => !v)}
+            title="Рация — док-панель поверх текущего экрана"
+          >
+            Рация{talking && <span className="nav-badge talk">●</span>}
           </button>
         </nav>
         <div className="status">
@@ -69,12 +81,12 @@ export default function App() {
       </header>
 
       {mesh.notice && (
-        <div className="notice" onClick={() => mesh.setNotice(null)}>
+        <div className="notice" role="alert" onClick={() => mesh.setNotice(null)}>
           {mesh.notice}
         </div>
       )}
 
-      <div className="toasts">
+      <div className="toasts" aria-live="polite">
         {mesh.toasts.map((t) => (
           <div key={t.id} className="event-toast">
             {t.text}
@@ -98,6 +110,9 @@ export default function App() {
           talker={rtc.pttTalker}
           talkingMe={rtc.pttTalking}
           secure={rtc.pttSecure}
+          recent={rtc.pttRecent}
+          callLog={rtc.callLog}
+          onClearLog={rtc.clearHistory}
           onStart={rtc.startPtt}
           onKey={rtc.keyPtt}
           onEnd={rtc.endPtt}
@@ -122,11 +137,22 @@ export default function App() {
       {tab === 'chat' && (
         <ChatView
           messages={mesh.hydratedMessages}
+          files={mesh.hydratedFiles}
+          messagesMore={mesh.messagesMore}
+          typing={mesh.typing}
+          reads={mesh.reads}
           chats={mesh.chats}
           subscribers={mesh.subscribers}
           online={mesh.online}
           myCallsign={callsign}
           onSend={(b, r) => void mesh.sendMessage(b, r)}
+          onUpdateMessage={(m, b) => mesh.updateMessage(m, b)}
+          onDeleteMessage={(m) => void mesh.deleteMessage(m)}
+          onSendFile={(name, mime, data, r) => mesh.sendFile(name, mime, data, r)}
+          onEnsureBlob={(f) => mesh.ensureFileBlob(f)}
+          onLoadHistory={() => void mesh.loadHistory()}
+          onTyping={(to) => mesh.sendTyping(to)}
+          onRead={(to, n) => mesh.sendRead(to, n)}
           onCall={rtc.startCall}
         />
       )}

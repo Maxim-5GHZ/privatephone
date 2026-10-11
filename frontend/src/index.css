@@ -66,6 +66,72 @@ nav button.active {
   background: var(--accent);
 }
 
+.nav-badge {
+  display: inline-block;
+  min-width: 20px;
+  margin-left: 6px;
+  padding: 1px 6px;
+  border-radius: 999px;
+  background: #1d2c44;
+  color: #cfe2ff;
+  font-size: 12px;
+  font-weight: 700;
+  text-align: center;
+}
+
+.nav-badge.danger {
+  background: #7f1d1d;
+  color: #fff;
+}
+
+.nav-badge.talk {
+  background: #14532d;
+  color: #7ee2a6;
+}
+
+.sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
+}
+
+button:focus-visible,
+input:focus-visible,
+select:focus-visible,
+a:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+/* rail items are buttons now (keyboard accessible) */
+button.rail-item {
+  background: transparent;
+  border: none;
+  color: var(--fg);
+  text-align: left;
+  width: 100%;
+  font-size: 14px;
+}
+
+button.rail-item.active {
+  background: var(--line);
+}
+
+/* admin tables scroll on tablets instead of breaking layout */
+.admin {
+  overflow-x: auto;
+}
+
+.admin table {
+  min-width: 560px;
+}
+
 .status {
   margin-left: auto;
   display: flex;
@@ -305,6 +371,67 @@ textarea {
 
 .chat-input input {
   flex: 1;
+  min-height: 44px;
+}
+
+.chat-input button {
+  min-height: 44px;
+}
+
+/* --- chat phase-2: search / typing / files / edit --- */
+.chat-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.chat-search {
+  margin-left: auto;
+  max-width: 180px;
+}
+
+.typing {
+  font-size: 12px;
+  color: var(--ok);
+  font-style: italic;
+}
+
+.load-more {
+  align-self: center;
+  margin-bottom: 8px;
+}
+
+.edit-box {
+  display: flex;
+  gap: 6px;
+  flex: 1;
+}
+
+.edit-box input {
+  flex: 1;
+}
+
+.msg-ops {
+  display: flex;
+  gap: 4px;
+  margin-left: 6px;
+}
+
+.pop-btn.danger {
+  color: #ff9e9e;
+  border-color: #7f2a2a;
+}
+
+.file-card {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+
+.file-name {
+  font-weight: 600;
 }
 
 /* admin */
@@ -374,6 +501,7 @@ textarea {
   border-radius: 8px;
   cursor: pointer;
   color: var(--fg);
+  min-height: 44px;
 }
 
 .rail-item:hover {
@@ -525,7 +653,18 @@ textarea {
   padding: 6px 10px;
   display: flex;
   align-items: center;
+  flex-wrap: wrap;
   gap: 6px;
+  max-width: calc(100% - 20px);
+}
+
+.map-toolbar button,
+.map-toolbar select {
+  min-height: 40px;
+}
+
+.alarm-armed {
+  animation: alert-pulse 0.8s ease-in-out infinite;
 }
 
 .map-toolbar input[type='checkbox'] {
@@ -560,7 +699,8 @@ textarea {
   top: 48px;
   left: 50%;
   transform: translateX(-50%);
-  z-index: 1200;
+  /* above toasts/menu so SOS is never covered */
+  z-index: 1600;
   display: flex;
   flex-direction: column;
   gap: 8px;
@@ -735,6 +875,30 @@ textarea {
 }
 
 .ptt-talker {
+  font-size: 12px;
+}
+
+.ptt-queue {
+  font-size: 12px;
+}
+
+.call-log {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  border-top: 1px solid var(--line);
+  padding-top: 8px;
+}
+
+.call-log-head {
+  align-items: center;
+  justify-content: space-between;
+}
+
+.call-log-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
   font-size: 12px;
 }
 

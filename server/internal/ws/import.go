@@ -169,6 +169,12 @@ func (h *Hub) replayImport(ctx context.Context, e db.JournalEntry, role string) 
 		err = h.IngestMarkerDelete(ctx, f, role)
 	case "message":
 		_, err = h.IngestMessage(ctx, f)
+	case "message_update":
+		_, err = h.IngestMessageUpdate(ctx, f)
+	case "message_delete":
+		err = h.IngestMessageDelete(ctx, f, role)
+	case "file":
+		_, err = h.IngestFile(ctx, f)
 	case "alert":
 		_, err = h.IngestAlert(ctx, f)
 	case "alert_ack":

@@ -37,6 +37,24 @@ export interface Message {
   body: string
   n: string
   created_at: string
+  edited?: number
+}
+
+// FileMeta is one E2EE file/voice attachment. blob (base64 ciphertext) is
+// present on live/pending/downloaded rows; snapshot rows carry metadata only.
+// fileKey (base64) is resolved client-side from the e2ee envelope.
+export interface FileMeta {
+  id: number
+  sender: string
+  recipient: string
+  name: string
+  mime: string
+  size: number
+  blob?: string
+  enc: string
+  n: string
+  created_at: string
+  fileKey?: string | null
 }
 
 export interface Chat {
@@ -69,6 +87,8 @@ export interface Packet {
 export interface Snapshot {
   markers: Marker[]
   messages: Message[]
+  messages_more?: boolean
+  files?: FileMeta[]
   alerts?: Alert[]
   zones?: Zone[]
   chats?: Chat[]
@@ -94,6 +114,11 @@ export type WSMsg =
   | { kind: 'marker_updated'; data: Marker }
   | { kind: 'marker_deleted'; data: { sender: string; n: string; id?: number } }
   | { kind: 'message'; data: Message }
+  | { kind: 'message_updated'; data: Message }
+  | { kind: 'message_deleted'; data: { sender: string; n: string; id?: number } }
+  | { kind: 'file'; data: FileMeta }
+  | { kind: 'typing'; sender: string; data: { to: string } }
+  | { kind: 'message_read'; sender: string; data: { to: string; n: string } }
   | { kind: 'chat_created'; data: Chat }
   | { kind: 'chat_updated'; data: Chat }
   | { kind: 'chat_deleted'; data: { id: string } }

@@ -26,9 +26,6 @@ type Subscriber struct {
 	Role     string `json:"role"`
 	PubKey   string `json:"pubkey"`
 	Revoked  int64  `json:"revoked"`
-	// HasKey: приватный ключ на escrow у админа (можно перевыпустить файл).
-	// Сам ключ никогда не отдаётся в списке — только через отдельный endpoint.
-	HasKey bool `json:"has_key"`
 }
 
 type Marker struct {
@@ -120,15 +117,9 @@ type JournalEntry struct {
 }
 
 func (s *Store) AddSubscriber(ctx context.Context, id, callsign, role, pubkey string) error {
-	return s.AddSubscriberWithKey(ctx, id, callsign, role, pubkey, "")
-}
-
-// AddSubscriberWithKey регистрирует абонента и кладёт приватный ключ на escrow
-// к админу (в зашифрованную базу). Пустой privkey — без escrow (легаси/тесты).
-func (s *Store) AddSubscriberWithKey(ctx context.Context, id, callsign, role, pubkey, privkey string) error {
 	_, err := s.db.ExecContext(ctx,
-		`INSERT INTO subscribers (id, callsign, role, pubkey, privkey) VALUES (?, ?, ?, ?, ?)`,
-		id, callsign, role, pubkey, privkey)
+		`INSERT INTO subscribers (id, callsign, role, pubkey) VALUES (?, ?, ?, ?)`,
+		id, callsign, role, pubkey)
 	if err != nil {
 		if isUniqueViolation(err) {
 			return errors.Join(ErrDuplicate, err)
@@ -139,40 +130,23 @@ func (s *Store) AddSubscriberWithKey(ctx context.Context, id, callsign, role, pu
 	return nil
 }
 
-// SubscriberPrivkey отдаёт escrow-копию приватного ключа (только для ручки
-// админа). Пусто — значит ключ не хранится (абонент до escrow).
-func (s *Store) SubscriberPrivkey(ctx context.Context, callsign string) (string, error) {
-	var priv string
-	err := s.db.QueryRowContext(ctx,
-		`SELECT privkey FROM subscribers WHERE callsign = ?`, callsign).Scan(&priv)
-	if errors.Is(err, sql.ErrNoRows) {
-		return "", ErrNotFound
-	}
-	if err != nil {
-		return "", err
-	}
-	return priv, nil
-}
-
 func (s *Store) SubscriberByCallsign(ctx context.Context, callsign string) (*Subscriber, error) {
 	row := s.db.QueryRowContext(ctx,
-		`SELECT id, callsign, role, pubkey, revoked, (CASE WHEN privkey <> '' THEN 1 ELSE 0 END) FROM subscribers WHERE callsign = ?`, callsign)
+		`SELECT id, callsign, role, pubkey, revoked FROM subscribers WHERE callsign = ?`, callsign)
 	sub := &Subscriber{}
-	var hasKey int
-	err := row.Scan(&sub.ID, &sub.Callsign, &sub.Role, &sub.PubKey, &sub.Revoked, &hasKey)
+	err := row.Scan(&sub.ID, &sub.Callsign, &sub.Role, &sub.PubKey, &sub.Revoked)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, ErrNotFound
 	}
 	if err != nil {
 		return nil, err
 	}
-	sub.HasKey = hasKey != 0
 	return sub, nil
 }
 
 func (s *Store) ListSubscribers(ctx context.Context) ([]Subscriber, error) {
 	rows, err := s.db.QueryContext(ctx,
-		`SELECT id, callsign, role, pubkey, revoked, (CASE WHEN privkey <> '' THEN 1 ELSE 0 END), created_at FROM subscribers ORDER BY created_at`)
+		`SELECT id, callsign, role, pubkey, revoked, created_at FROM subscribers ORDER BY created_at`)
 	if err != nil {
 		return nil, err
 	}
@@ -181,11 +155,9 @@ func (s *Store) ListSubscribers(ctx context.Context) ([]Subscriber, error) {
 	for rows.Next() {
 		var sub Subscriber
 		var created string
-		var hasKey int
-		if err := rows.Scan(&sub.ID, &sub.Callsign, &sub.Role, &sub.PubKey, &sub.Revoked, &hasKey, &created); err != nil {
+		if err := rows.Scan(&sub.ID, &sub.Callsign, &sub.Role, &sub.PubKey, &sub.Revoked, &created); err != nil {
 			return nil, err
 		}
-		sub.HasKey = hasKey != 0
 		out = append(out, sub)
 	}
 	return out, rows.Err()
@@ -484,10 +456,39 @@ func (s *Store) ListZones(ctx context.Context) ([]Zone, error) {
 	return out, rows.Err()
 }
 
-// recipientMaybe matches messages addressed to the whole network, to the caller,
-// to a group containing the caller, or sent by the caller (own copy).
+// recipientMaybe is a SQL prefilter for group recipients (stored as a JSON
+// array like ["bob","admin"]). LIKE metacharacters in the callsign are
+// escaped so the prefilter stays tight; exact membership is enforced in Go by
+// visibleTo, because a substring match would also hit ["bobby"] for "bob".
 func recipientMaybe(callsign string) string {
-	return `%"` + callsign + `"%`
+	esc := strings.NewReplacer(`\`, `\\`, `%`, `\%`, `_`, `\_`)
+	return `%"` + esc.Replace(callsign) + `"%`
+}
+
+// visibleTo reports whether a stored row is really addressed to callsign.
+// The SQL LIKE prefilter above is not exact: callsigns are free-form, so
+// LIKE wildcards inside them ("_" or "%") would match foreign groups.
+// The exact check happens here: broadcast, own sends, direct address, exact
+// JSON-array membership, or a named chat the caller belongs to.
+func visibleTo(sender, recipient, callsign string, chats map[string]bool) bool {
+	if recipient == "" || sender == callsign || recipient == callsign {
+		return true
+	}
+	if chats[recipient] {
+		return true
+	}
+	if strings.HasPrefix(recipient, "[") {
+		var members []string
+		if err := json.Unmarshal([]byte(recipient), &members); err != nil {
+			return false
+		}
+		for _, m := range members {
+			if m == callsign {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func (s *Store) AddMessage(ctx context.Context, sender, recipient, body, nonce string) (int64, error) {
@@ -528,7 +529,7 @@ func (s *Store) ListMessagesFor(ctx context.Context, callsign string) ([]Message
 		return nil, err
 	}
 	query := `SELECT id, sender, recipient, body, n, created_at FROM messages
-		 WHERE recipient = '' OR sender = ? OR recipient = ? OR recipient LIKE ?`
+		 WHERE recipient = '' OR sender = ? OR recipient = ? OR recipient LIKE ? ESCAPE '\'`
 	args := []any{callsign, callsign, recipientMaybe(callsign)}
 	if len(chatRecipients) > 0 {
 		placeholders := make([]string, len(chatRecipients))
@@ -544,11 +545,18 @@ func (s *Store) ListMessagesFor(ctx context.Context, callsign string) ([]Message
 		return nil, err
 	}
 	defer rows.Close()
+	chats := make(map[string]bool, len(chatRecipients))
+	for _, r := range chatRecipients {
+		chats[r] = true
+	}
 	var out []Message
 	for rows.Next() {
 		var m Message
 		if err := rows.Scan(&m.ID, &m.Sender, &m.Recipient, &m.Body, &m.Nonce, &m.Created); err != nil {
 			return nil, err
+		}
+		if !visibleTo(m.Sender, m.Recipient, callsign, chats) {
+			continue
 		}
 		out = append(out, m)
 	}
@@ -748,8 +756,9 @@ func (s *Store) UndeliveredPacketsFor(ctx context.Context, callsign string) ([]P
 		return nil, err
 	}
 	query := `SELECT id, sender, kind, payload, signature, nonce, recipient, ts FROM packets
-		 WHERE delivered = 0 AND (recipient = '' OR sender = ? OR recipient = ? OR recipient LIKE ?`
-	args := []any{callsign, callsign, recipientMaybe(callsign)}
+		 WHERE delivered = 0 AND id NOT IN (SELECT packet_id FROM packet_acks WHERE recipient = ?)
+		 AND (recipient = '' OR sender = ? OR recipient = ? OR recipient LIKE ? ESCAPE '\'`
+	args := []any{callsign, callsign, callsign, recipientMaybe(callsign)}
 	if len(chatRecipients) > 0 {
 		placeholders := make([]string, len(chatRecipients))
 		for i, r := range chatRecipients {
@@ -764,19 +773,30 @@ func (s *Store) UndeliveredPacketsFor(ctx context.Context, callsign string) ([]P
 		return nil, err
 	}
 	defer rows.Close()
+	chats := make(map[string]bool, len(chatRecipients))
+	for _, r := range chatRecipients {
+		chats[r] = true
+	}
 	var out []Packet
 	for rows.Next() {
 		var p Packet
 		if err := rows.Scan(&p.ID, &p.Sender, &p.Kind, &p.Payload, &p.Signature, &p.Nonce, &p.Recipient, &p.TS); err != nil {
 			return nil, err
 		}
+		if !visibleTo(p.Sender, p.Recipient, callsign, chats) {
+			continue
+		}
 		out = append(out, p)
 	}
 	return out, rows.Err()
 }
 
-func (s *Store) MarkDelivered(ctx context.Context, ids []string) error {
-	if len(ids) == 0 {
+// MarkDelivered records a store-and-forward acknowledgment for one recipient.
+// Delivery state is per-recipient (packet_acks): one client's ack never wipes
+// the backlog of the others. Rows already flagged delivered = 1 by the legacy
+// global ack stay consumed for everyone.
+func (s *Store) MarkDelivered(ctx context.Context, ids []string, callsign string) error {
+	if len(ids) == 0 || callsign == "" {
 		return nil
 	}
 	tx, err := s.db.BeginTx(ctx, nil)
@@ -785,7 +805,7 @@ func (s *Store) MarkDelivered(ctx context.Context, ids []string) error {
 	}
 	for _, id := range ids {
 		if _, err := tx.ExecContext(ctx,
-			`UPDATE packets SET delivered = 1 WHERE id = ? AND delivered = 0`, id); err != nil {
+			`INSERT OR IGNORE INTO packet_acks (packet_id, recipient) VALUES (?, ?)`, id, callsign); err != nil {
 			_ = tx.Rollback()
 			return err
 		}

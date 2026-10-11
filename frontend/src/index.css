@@ -555,6 +555,24 @@ textarea {
 }
 
 /* --- alert banner --- */
+.alert-queue {
+  position: fixed;
+  top: 48px;
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 1200;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  max-width: min(720px, 92vw);
+}
+
+.alert-queue .alert-banner {
+  position: static;
+  transform: none;
+  max-width: none;
+}
+
 .alert-banner {
   position: fixed;
   top: 48px;

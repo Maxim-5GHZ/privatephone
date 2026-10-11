@@ -157,6 +157,12 @@ CREATE TABLE IF NOT EXISTS packets (
 	recv_at    TEXT NOT NULL DEFAULT (datetime('now')),
 	delivered  INTEGER NOT NULL DEFAULT 0
 );
+CREATE TABLE IF NOT EXISTS packet_acks (
+	packet_id TEXT NOT NULL,
+	recipient TEXT NOT NULL,
+	acked_at  TEXT NOT NULL DEFAULT (datetime('now')),
+	PRIMARY KEY (packet_id, recipient)
+);
 CREATE TABLE IF NOT EXISTS alerts (
 	id         INTEGER PRIMARY KEY AUTOINCREMENT,
 	sender     TEXT NOT NULL,
@@ -209,7 +215,7 @@ CREATE TABLE IF NOT EXISTS chats (
 	if err := s.ensureColumn("subscribers", "revoked", "INTEGER NOT NULL DEFAULT 0"); err != nil {
 		return err
 	}
-	if err := s.ensureColumn("subscribers", "privkey", "TEXT NOT NULL DEFAULT ''"); err != nil {
+	if err := s.dropEscrowColumn(); err != nil {
 		return err
 	}
 	if err := s.backfillRecipient(context.Background()); err != nil {
@@ -223,6 +229,40 @@ CREATE TABLE IF NOT EXISTS chats (
 	return nil
 }
 
+// dropEscrowColumn removes the legacy subscribers.privkey column (escrow was
+// removed: private keys are issued once and never stored server-side). Vaults
+// created before the removal lose the escrowed copies on first open — that is
+// the point: a stolen vault must not yield every subscriber's private key.
+func (s *Store) dropEscrowColumn() error {
+	rows, err := s.db.Query("PRAGMA table_info(subscribers)")
+	if err != nil {
+		return fmt.Errorf("migrate subscribers: %w", err)
+	}
+	defer rows.Close()
+	found := false
+	for rows.Next() {
+		var cid int
+		var name, ctype string
+		var notnull, pk int
+		var dflt any
+		if err := rows.Scan(&cid, &name, &ctype, &notnull, &dflt, &pk); err != nil {
+			return err
+		}
+		if name == "privkey" {
+			found = true
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	if !found {
+		return nil
+	}
+	if _, err := s.db.Exec("ALTER TABLE subscribers DROP COLUMN privkey"); err != nil {
+		return fmt.Errorf("migrate subscribers.privkey: %w", err)
+	}
+	return nil
+}
 // ensureColumn adds a column when it is missing (idempotent migration).
 func (s *Store) ensureColumn(table, column, ddl string) error {
 	rows, err := s.db.Query("PRAGMA table_info(" + table + ")")

@@ -37,7 +37,6 @@ export interface Message {
   body: string
   n: string
   created_at: string
-  encrypted?: boolean
 }
 
 export interface Chat {
@@ -54,7 +53,6 @@ export interface Subscriber {
   role: string
   pubkey: string
   revoked?: number
-  has_key?: boolean
 }
 
 export interface Packet {

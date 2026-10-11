@@ -86,7 +86,6 @@ function packetToMessage(p: Packet): Message | null {
         body: JSON.stringify(d.enc),
         n: p.nonce,
         created_at: '',
-        encrypted: true,
       }
     }
     return null
@@ -131,7 +130,6 @@ export interface MeshApi {
   zones: Zone[]
   chats: Chat[]
   subscribers: Subscriber[]
-  subsReady: boolean
   online: string[]
   connected: boolean
   notice: string | null
@@ -173,7 +171,6 @@ export function useMesh({ callsign, wsRef, pubsRef, signalRef }: MeshOptions): M
   const [zones, setZones] = useState<Zone[]>([])
   const [chats, setChats] = useState<Chat[]>([])
   const [subscribers, setSubscribers] = useState<Subscriber[]>([])
-  const [subsReady, setSubsReady] = useState(false)
   const [online, setOnline] = useState<string[]>([])
   const [connected, setConnected] = useState(false)
   const [notice, setNotice] = useState<string | null>(null)
@@ -224,7 +221,7 @@ export function useMesh({ callsign, wsRef, pubsRef, signalRef }: MeshOptions): M
   const hydratedMessages = useMemo(() => {
     return messages.map((m) => {
       if (!looksLikeEnvelope(m.body)) return m
-      return { ...m, body: decrypted.get(encId('ms', m.sender, m.body)) ?? '[зашифровано]', encrypted: true }
+      return { ...m, body: decrypted.get(encId('ms', m.sender, m.body)) ?? '[зашифровано]' }
     })
   }, [messages, decrypted])
 
@@ -321,9 +318,10 @@ export function useMesh({ callsign, wsRef, pubsRef, signalRef }: MeshOptions): M
               if (zz) newZones = upsertZone(newZones, zz)
             } else if (p.kind === 'zone_update') {
               try {
-                const d = JSON.parse(p.payload) as { name?: string; color?: string }
+                const d = JSON.parse(p.payload) as { n?: string; target?: string; name?: string; color?: string }
+                const tn = d.target ?? d.n ?? ''
                 setZones((prev) =>
-                  prev.map((x) => (x.sender === p.sender && x.n === p.nonce ? { ...x, name: d.name ?? x.name, color: d.color ?? x.color } : x)),
+                  prev.map((x) => (x.sender === p.sender && x.n === tn ? { ...x, name: d.name ?? x.name, color: d.color ?? x.color } : x)),
                 )
               } catch {
                 /* ignore */
@@ -332,9 +330,10 @@ export function useMesh({ callsign, wsRef, pubsRef, signalRef }: MeshOptions): M
               setZones((prev) => removeZone(prev, p.sender, p.nonce))
             } else if (p.kind === 'marker_update') {
               try {
-                const d = JSON.parse(p.payload) as { n: string; type?: string; desc?: string }
+                const d = JSON.parse(p.payload) as { n?: string; target?: string; type?: string; desc?: string }
+                const tn = d.target ?? d.n ?? ''
                 setMarkers((prev) =>
-                  prev.map((x) => (x.sender === p.sender && x.n === d.n ? { ...x, type: d.type ?? x.type, desc: d.desc ?? x.desc } : x)),
+                  prev.map((x) => (x.sender === p.sender && x.n === tn ? { ...x, type: d.type ?? x.type, desc: d.desc ?? x.desc } : x)),
                 )
               } catch {
                 /* ignore */
@@ -455,14 +454,12 @@ export function useMesh({ callsign, wsRef, pubsRef, signalRef }: MeshOptions): M
     apiGet('/api/v1/subscribers', 'list_subscribers')
       .then((d) => {
         setSubscribers((d as { subscribers: Subscriber[] }).subscribers ?? [])
-        setSubsReady(true)
       })
       .catch((e) => {
         // Не глотаем: чаще всего это чужой ключ (другой data-каталог).
         setNotice(
           `Сервер отклонил ключ ${(e as Error).message}. Войдите заново файлом из data-каталога этого узла.`,
         )
-        setSubsReady(true)
       })
     fetchChats()
       .then((c) => setChats((c as Chat[]) ?? []))
@@ -473,7 +470,7 @@ export function useMesh({ callsign, wsRef, pubsRef, signalRef }: MeshOptions): M
     }
   }, [callsign, handleMsg, wsRef])
 
-  const sendEnc = async (kind: string, path: string, plaintext: object, recipient = '') => {
+  const sendEnc = async (kind: string, path: string, plaintext: object, recipient = '', outer: Record<string, unknown> = {}) => {
     if (!getEcdhKey()) throw new Error('E2EE-ключ недоступен: печатайте этим же PEM')
     // named chat: encrypt for chat members, store recipient as "chat:<id>"
     let recips = recipientList(recipient)
@@ -493,7 +490,7 @@ export function useMesh({ callsign, wsRef, pubsRef, signalRef }: MeshOptions): M
     const members = Array.from(union, ([cs, pubPEM]) => ({ callsign: cs, pubPEM }))
     if (members.length === 0) throw new Error('Нет известных ключей получателей')
     const env = await encrypt(members, JSON.stringify(plaintext))
-    return apiPost(path, kind, { n: nonce(), recipient, enc: env })
+    return apiPost(path, kind, { n: nonce(), recipient, enc: env, ...outer })
   }
 
   const sendMessage = async (body: string, recipient: string) => {
@@ -517,7 +514,9 @@ export function useMesh({ callsign, wsRef, pubsRef, signalRef }: MeshOptions): M
 
   const updateMarker = async (m: Marker, type: string, desc: string) => {
     try {
-      const rec = (await sendEnc('marker_update', '/api/v1/markers', { lat: m.lat, lon: m.lon, type, desc })) as Marker
+      // target: plaintext routing to the original nonce — the envelope `n`
+      // is always fresh, so the server cannot look the marker up by it.
+      const rec = (await sendEnc('marker_update', '/api/v1/markers', { lat: m.lat, lon: m.lon, type, desc }, '', { target: m.n })) as Marker
       setMarkers((prev) => upsertMarker(prev, rec))
     } catch (e) {
       setNotice((e as Error).message)
@@ -578,7 +577,7 @@ export function useMesh({ callsign, wsRef, pubsRef, signalRef }: MeshOptions): M
       } catch {
         /* keep [] */
       }
-      const rec = (await sendEnc('zone_update', '/api/v1/zones', { points: pts, name, color })) as Zone
+      const rec = (await sendEnc('zone_update', '/api/v1/zones', { points: pts, name, color }, '', { target: z.n })) as Zone
       setZones((prev) => upsertZone(prev, rec))
     } catch (e) {
       setNotice((e as Error).message)
@@ -632,7 +631,6 @@ export function useMesh({ callsign, wsRef, pubsRef, signalRef }: MeshOptions): M
     setZones([])
     setChats([])
     setSubscribers([])
-    setSubsReady(false)
     setOnline([])
     setNotice(null)
   }
@@ -685,7 +683,6 @@ export function useMesh({ callsign, wsRef, pubsRef, signalRef }: MeshOptions): M
     zones,
     chats,
     subscribers,
-    subsReady,
     online,
     connected,
     notice,

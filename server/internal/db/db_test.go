@@ -188,3 +188,65 @@ func TestPersistentEveryCancels(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+// TestEscrowColumnDropped simulates a pre-removal vault that still carries
+// subscribers.privkey: reopening must destroy the escrow copies (DROP COLUMN)
+// while keeping the subscriber rows themselves intact.
+func TestEscrowColumnDropped(t *testing.T) {
+	dir := t.TempDir()
+	key := testKey(t)
+	ctx := context.Background()
+	st, err := Open(dir, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := st.AddSubscriber(ctx, "id1", "bob", "operator", "pub-bob"); err != nil {
+		t.Fatal(err)
+	}
+	// Forge the legacy column as an old binary would have left it.
+	if _, err := st.db.Exec(`ALTER TABLE subscribers ADD COLUMN privkey TEXT NOT NULL DEFAULT ''`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.db.Exec(`UPDATE subscribers SET privkey = 'PRIVATE-ESCROW' WHERE callsign = 'bob'`); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.Persist(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.Close(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	st2, err := Open(dir, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st2.Close(ctx)
+	rows, err := st2.db.Query(`PRAGMA table_info(subscribers)`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var cid int
+		var name, ctype string
+		var notnull, pk int
+		var dflt any
+		if err := rows.Scan(&cid, &name, &ctype, &notnull, &dflt, &pk); err != nil {
+			t.Fatal(err)
+		}
+		if name == "privkey" {
+			t.Fatal("legacy escrow column must be dropped on open")
+		}
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+	sub, err := st2.SubscriberByCallsign(ctx, "bob")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sub.PubKey != "pub-bob" || sub.Role != "operator" {
+		t.Fatalf("subscriber row must survive escrow removal: %+v", sub)
+	}
+}

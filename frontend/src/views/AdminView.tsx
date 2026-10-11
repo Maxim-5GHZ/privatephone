@@ -4,7 +4,6 @@ import {
   clearTiles,
   fetchJournal,
   fetchAdminStats,
-  fetchSubscriberKey,
   fetchTilesFetchStatus,
   fetchTilesStatus,
   importJournal,
@@ -171,7 +170,6 @@ function SubscribersTab({
   const [error, setError] = useState<string | null>(null)
   const [busy, setBusy] = useState(false)
   const [fp, setFp] = useState<Map<string, string>>(new Map())
-  const [reissued, setReissued] = useState<{ callsign: string; pem: string } | null>(null)
 
   const createSub = async () => {
     const cs = callsign.trim().toLowerCase()
@@ -223,38 +221,15 @@ function SubscribersTab({
     }
   }
 
-  const reissueKey = async (s: Subscriber) => {
-    setBusy(true)
-    setError(null)
-    setReissued(null)
-    try {
-      const r = await fetchSubscriberKey(s.callsign)
-      setReissued({ callsign: r.callsign, pem: r.private_pem })
-    } catch (e) {
-      setError((e as Error).message)
-    } finally {
-      setBusy(false)
-    }
-  }
-
-  const downloadPem = (callsign: string, pem: string) => {
-    const blob = new Blob([pem], { type: 'text/plain' })
-    const url = URL.createObjectURL(blob)
-    const a = document.createElement('a')
-    a.href = url
-    a.download = `${callsign}.prv.pem`
-    a.click()
-    URL.revokeObjectURL(url)
-  }
-
   return (
     <>
       <p className="muted">Отзыв запрещает вход по ключу и немедленно разрывает соединение.</p>
       {!isAdmin && <p className="muted">Создание и отзыв доступны только администратору. Ниже — общий список для выбора получателей.</p>}
       {isAdmin && (
         <p className="muted">
-          Приватные ключи хранятся у вас (escrow в зашифрованной базе): при утере флешки ключ можно скачать повторно
-          кнопкой «ключ». Раздавайте <code>.prv.pem</code> только владельцу через доверенный канал.
+          Приватный ключ выдаётся один раз при создании и на сервере не хранится. Раздавайте{' '}
+          <code>.prv.pem</code> только владельцу через доверенный канал. При утере флешки: отзовите позывной
+          кнопкой «Отозвать» и создайте новый.
         </p>
       )}
       <table>
@@ -264,7 +239,6 @@ function SubscribersTab({
             <th>Роль</th>
             <th>Отпечаток ключа</th>
             <th>Статус</th>
-            {isAdmin && <th>Ключ</th>}
             {isAdmin && <th />}
           </tr>
         </thead>
@@ -280,19 +254,6 @@ function SubscribersTab({
                 </button>
               </td>
               <td>{s.revoked ? <span className="error">ОТОЗВАН</span> : <span className="muted">активен</span>}</td>
-              {isAdmin && (
-                <td>
-                  {s.has_key ? (
-                    <button className="ghost" onClick={() => void reissueKey(s)} disabled={busy}>
-                      ключ
-                    </button>
-                  ) : (
-                    <span className="muted" title="Абонент создан до escrow — ключ только на его флешке">
-                      —
-                    </span>
-                  )}
-                </td>
-              )}
               {isAdmin && (
                 <td>
                   <button className="danger-ghost" onClick={() => void toggleRevoke(s)} disabled={s.callsign === 'admin'}>
@@ -328,21 +289,12 @@ function SubscribersTab({
       {issued && (
         <div className="issued">
           <p>
-            Ключ для <b>{issued.callsign}</b> готов и сохранён у вас (escrow). Сохраните его на USB-флешку абонента
-            (файл <code>{issued.callsign}.prv.pem</code>). Поднесите флешку при входе — тот же ключ работает и для
-            E2EE.
+            Ключ для <b>{issued.callsign}</b> создан. Сохраните его на USB-флешку абонента
+            (файл <code>{issued.callsign}.prv.pem</code>) — это единственный показ ключа, повторно
+            скачать его нельзя. Поднесите флешку при входе — тот же ключ работает и для E2EE.
           </p>
           <button onClick={download}>Скачать приватный ключ</button>
           <textarea readOnly value={issued.pem} rows={7} />
-        </div>
-      )}
-      {reissued && (
-        <div className="issued">
-          <p>
-            Повторная выдача для <b>{reissued.callsign}</b> (из escrow). Запишите на новую флешку владельца.
-          </p>
-          <button onClick={() => downloadPem(reissued.callsign, reissued.pem)}>Скачать {reissued.callsign}.prv.pem</button>
-          <textarea readOnly value={reissued.pem} rows={7} />
         </div>
       )}
     </>

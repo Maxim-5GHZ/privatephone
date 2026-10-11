@@ -387,40 +387,6 @@ func (s *Server) handleAdminStats(w http.ResponseWriter, r *http.Request, ev *pr
 	})
 }
 
-// handleGetSubscriberKey перевыпускает файл ключа из escrow админа
-// (приватный ключ хранится в зашифрованной базе). Только admin.
-func (s *Server) handleGetSubscriberKey(w http.ResponseWriter, r *http.Request, ev *protocol.Envelope) {
-	var req struct {
-		Callsign string `json:"callsign"`
-	}
-	if err := json.Unmarshal(ev.Data, &req); err != nil || req.Callsign == "" {
-		writeErr(w, http.StatusBadRequest, "callsign required")
-		return
-	}
-	callsign := normalizeCallsign(req.Callsign)
-	if callsign == "" {
-		writeErr(w, http.StatusBadRequest, "bad callsign")
-		return
-	}
-	priv, err := s.st.SubscriberPrivkey(r.Context(), callsign)
-	if err != nil {
-		if errors.Is(err, db.ErrNotFound) {
-			writeErr(w, http.StatusNotFound, "unknown callsign")
-			return
-		}
-		writeErr(w, http.StatusInternalServerError, "subscriber key")
-		return
-	}
-	if priv == "" {
-		writeErr(w, http.StatusNotFound, "no stored key for this callsign (created before escrow)")
-		return
-	}
-	writeJSON(w, http.StatusOK, map[string]any{
-		"callsign":    callsign,
-		"private_pem": priv,
-	})
-}
-
 // handleListChats returns named chats visible to the caller: members see
 // their chats, admin sees everything.
 func (s *Server) handleListChats(w http.ResponseWriter, r *http.Request, ev *protocol.Envelope) {

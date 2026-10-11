@@ -43,20 +43,29 @@ func (h *Hub) IngestMarker(ctx context.Context, f protocol.Frame) (db.Marker, er
 }
 
 // IngestMarkerUpdate edits type/description of a marker the sender authored.
+// The target marker is addressed by `target` (the nonce stored at creation);
+// `n` is accepted as a fallback for plaintext clients. A separate field is
+// required because E2EE updates arrive in a fresh envelope whose own `n` is
+// new — looking the marker up by it would always miss.
 // E2EE updates carry the full new content (lat/lon/type/desc) encrypted so the
 // node never merges patches it cannot read.
 func (h *Hub) IngestMarkerUpdate(ctx context.Context, f protocol.Frame) (db.Marker, error) {
 	var m struct {
-		N    string          `json:"n"`
-		Type string          `json:"type"`
-		Desc string          `json:"desc"`
-		Enc  json.RawMessage `json:"enc"`
+		Target string          `json:"target"`
+		N      string          `json:"n"`
+		Type   string          `json:"type"`
+		Desc   string          `json:"desc"`
+		Enc    json.RawMessage `json:"enc"`
 	}
 	var rec db.Marker
 	if err := json.Unmarshal(f.Data, &m); err != nil {
 		return rec, err
 	}
-	cur, err := h.st.MarkerByNonce(ctx, f.Sender, m.N)
+	nonce := m.Target
+	if nonce == "" {
+		nonce = m.N
+	}
+	cur, err := h.st.MarkerByNonce(ctx, f.Sender, nonce)
 	if err != nil {
 		return rec, err
 	}
@@ -147,7 +156,7 @@ func (h *Hub) handleAck(ctx context.Context, f protocol.Frame) {
 	if err := json.Unmarshal(f.Data, &a); err != nil {
 		return
 	}
-	_ = h.st.MarkDelivered(ctx, a.IDs)
+	_ = h.st.MarkDelivered(ctx, a.IDs, f.Sender)
 }
 
 var alertTypes = map[string]bool{"sos": true, "gather": true, "info": true}
@@ -275,20 +284,28 @@ func (h *Hub) IngestZone(ctx context.Context, f protocol.Frame) (db.Zone, error)
 	return rec, nil
 }
 
-// IngestZoneUpdate renames/recolours a zone the sender authored. E2EE updates
-// carry the full polygon content encrypted; geometry comes from the envelope.
+// IngestZoneUpdate renames/recolours a zone the sender authored. The target
+// zone is addressed by `target` (nonce from creation), `n` is a fallback for
+// plaintext clients — same fresh-envelope reason as IngestMarkerUpdate.
+// E2EE updates carry the full polygon content encrypted; geometry comes from
+// the envelope.
 func (h *Hub) IngestZoneUpdate(ctx context.Context, f protocol.Frame) (db.Zone, error) {
 	var m struct {
-		Name  string          `json:"name"`
-		Color string          `json:"color"`
-		N     string          `json:"n"`
-		Enc   json.RawMessage `json:"enc"`
+		Name   string          `json:"name"`
+		Color  string          `json:"color"`
+		Target string          `json:"target"`
+		N      string          `json:"n"`
+		Enc    json.RawMessage `json:"enc"`
 	}
 	var rec db.Zone
 	if err := json.Unmarshal(f.Data, &m); err != nil {
 		return rec, err
 	}
-	cur, err := h.st.ZoneByNonce(ctx, f.Sender, m.N)
+	nonce := m.Target
+	if nonce == "" {
+		nonce = m.N
+	}
+	cur, err := h.st.ZoneByNonce(ctx, f.Sender, nonce)
 	if err != nil {
 		return rec, err
 	}

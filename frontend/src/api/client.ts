@@ -35,15 +35,6 @@ export async function revokeSubscriber(callsign: string, revoke: boolean): Promi
   await apiPost('/api/v1/ca/revoke', revoke ? 'revoke_subscriber' : 'unrevoke_subscriber', { callsign })
 }
 
-// Escrow: приватные ключи хранятся у админа в зашифрованной базе,
-// перевыпуск файла при утере флешки.
-export async function fetchSubscriberKey(callsign: string): Promise<{ callsign: string; private_pem: string }> {
-  return (await apiPost('/api/v1/ca/subscribers/key', 'get_subscriber_key', { callsign })) as {
-    callsign: string
-    private_pem: string
-  }
-}
-
 // --- Tamper-evident journal (admin) ---
 
 export interface JournalEntry {

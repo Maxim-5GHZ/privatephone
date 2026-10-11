@@ -29,8 +29,3 @@ export function playAlarm() {
   const seq = [0, 0.28, 0.56, 0.95, 1.23, 1.51]
   seq.forEach((t) => beep(950, 0.13, t))
 }
-
-export function playAck() {
-  beep(1245, 0.08, 0)
-  beep(1245, 0.08, 0.12)
-}

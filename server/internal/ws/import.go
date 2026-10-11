@@ -38,11 +38,18 @@ type ImportReport struct {
 }
 
 // ImportBag replays an exported journal bag onto this node. The whole bag is
-// validated before any write: it must continue the local chain (or be a full
-// seed bag), its internal hash chain must be intact, and every packet's
-// signature must verify against the local subscriber registry (identical
-// operator keypairs are provisioned on every node). Bags that were already
-// ingested are skipped idempotently via the deterministic packet id.
+// validated before any write: the not-yet-known suffix must continue the
+// local chain (or be a full seed bag), its internal hash chain must be
+// intact, and every new packet's signature must verify against the local
+// subscriber registry (identical operator keypairs are provisioned on every
+// node). Bags that were already ingested are skipped idempotently via the
+// deterministic packet id.
+//
+// Overlapping bags are supported: an already-known PREFIX is stripped and
+// only the new suffix is validated and replayed, so re-exporting with an
+// earlier boundary never loses rows. Known rows past the prefix (holes) are
+// skipped during replay; the local chain stays valid because rows are
+// journaled in bag order.
 func (h *Hub) ImportBag(ctx context.Context, entries []db.JournalEntry) (ImportReport, error) {
 	r := ImportReport{RejectedAt: -1}
 	if len(entries) == 0 {
@@ -51,28 +58,39 @@ func (h *Hub) ImportBag(ctx context.Context, entries []db.JournalEntry) (ImportR
 		return r, nil
 	}
 
-	ex, err := h.st.PacketExists(ctx, entries[0].ID)
-	if err != nil {
-		return r, err
+	// Strip the already-known prefix. A first-ID hit no longer discards the
+	// whole bag: only the prefix is duplicate, the suffix may hold new rows.
+	known := 0
+	for known < len(entries) {
+		ex, err := h.st.PacketExists(ctx, entries[known].ID)
+		if err != nil {
+			return r, err
+		}
+		if !ex {
+			break
+		}
+		known++
 	}
-	if ex {
+	if known == len(entries) {
 		r.SkippedDup = len(entries)
 		head, _ := h.st.JournalHead(ctx)
 		r.Head = head
 		return r, nil
 	}
+	r.SkippedDup = known
+	work := entries[known:]
 
 	head, err := h.st.JournalHead(ctx)
 	if err != nil {
 		return r, err
 	}
-	if head != entries[0].PrevHash {
-		r.Rejected, r.RejectedAt, r.RejectedWhy = true, 0,
-			"bag does not continue this node's journal chain (local head differs); import into an empty node or the immediate successor of the previous bag"
+	if head != work[0].PrevHash {
+		r.Rejected, r.RejectedAt, r.RejectedWhy = true, known,
+			"bag does not continue this node's journal chain (local head differs); import into an empty node, the immediate successor of the previous bag, or re-export with an overlapping boundary"
 		return r, nil
 	}
-	if bad := db.VerifyBag(entries); bad >= 0 {
-		r.Rejected, r.RejectedAt, r.RejectedWhy = true, bad, "bag internal hash chain is broken at this index"
+	if bad := db.VerifyBag(work); bad >= 0 {
+		r.Rejected, r.RejectedAt, r.RejectedWhy = true, known + bad, "bag internal hash chain is broken at this index"
 		return r, nil
 	}
 
@@ -85,20 +103,31 @@ func (h *Hub) ImportBag(ctx context.Context, entries []db.JournalEntry) (ImportR
 		}
 		return sub.PubKey, sub.Role, nil
 	}}
-	for i, e := range entries {
+	for i, e := range work {
 		f := entryFrame(e)
 		if _, err := ver.VerifyStored(ctx, f.Envelope()); err != nil {
-			r.Rejected, r.RejectedAt, r.RejectedWhy = true, i,
+			r.Rejected, r.RejectedAt, r.RejectedWhy = true, known + i,
 				"signature does not verify against the local registry: "+err.Error()
 			return r, nil
 		}
 	}
 
-	for i, e := range entries {
+	for i, e := range work {
+		// Holes: a row known locally but sitting past the stripped prefix is
+		// skipped; new rows are journaled in bag order so the local chain
+		// stays continuous.
+		ex, err := h.st.PacketExists(ctx, e.ID)
+		if err != nil {
+			return r, err
+		}
+		if ex {
+			r.SkippedDup++
+			continue
+		}
 		role, _ := ver.Role(ctx, e.Sender)
 		appended, ctxSkipped, err := h.replayImport(ctx, e, role)
 		if err != nil {
-			log.Printf("import row %d (%s by %s): %v", i, e.Kind, e.Sender, err)
+			log.Printf("import row %d (%s by %s): %v", known+i, e.Kind, e.Sender, err)
 		}
 		if appended {
 			r.AddedJournal++

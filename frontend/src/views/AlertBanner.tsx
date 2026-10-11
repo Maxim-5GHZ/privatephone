@@ -1,5 +1,5 @@
 import { useEffect, useRef } from 'react'
-import { playAck, playAlarm } from '../audio'
+import { playAlarm } from '../audio'
 import { Alert } from '../types'
 
 interface Props {
@@ -12,47 +12,53 @@ interface Props {
 
 const ALERT_LABEL: Record<string, string> = { sos: 'SOS', gather: 'СБОР', info: 'Инфо' }
 
+// AlertBanner renders the whole queue of active alerts, not just the latest:
+// in the field several alarms (SOS + сбор) overlap and the newest must not
+// hide the previous ones. The alarm sound fires once per new alert key.
 export function AlertBanner({ alerts, myCallsign, isAdmin, onAck, onClear }: Props) {
-  const last = alerts[alerts.length - 1]
-  const lastKey = last && last.n ? `${last.sender}/${last.n}` : ''
-  const prevKey = useRef<string>('')
+  const keys = alerts.map((a) => `${a.sender}/${a.n}`).join('|')
+  const seen = useRef<Set<string>>(new Set())
 
   useEffect(() => {
-    if (lastKey && lastKey !== prevKey.current) {
-      prevKey.current = lastKey
+    if (!keys) return
+    const fresh = keys.split('|').filter((k) => !seen.current.has(k))
+    if (fresh.length) {
+      fresh.forEach((k) => seen.current.add(k))
       playAlarm()
     }
-  }, [lastKey])
+  }, [keys])
 
-  if (!last) return null
-  const mine = last.sender === myCallsign
-  const acked = (last.acks ?? []).includes(myCallsign)
+  if (!alerts.length) return null
 
   return (
-    <div className={`alert-banner ${last.type}`}>
-      <div className="alert-text">
-        <b>{ALERT_LABEL[last.type] ?? last.type}</b> — {last.sender}
-        {last.text ? `: ${last.text}` : ''}
-        <span className="alert-acks">
-          приняли: {last.acks?.length ? last.acks.join(', ') : '—'}
-        </span>
-      </div>
-      <div className="alert-actions">
-        {!acked && (
-          <button onClick={() => onAck(last)}>
-            Принял
-          </button>
-        )}
-        {(mine || isAdmin) && (
-          <button className="ghost" onClick={() => onClear(last)}>
-            Отбой
-          </button>
-        )}
-      </div>
+    <div className="alert-queue">
+      {alerts.map((a) => {
+        const mine = a.sender === myCallsign
+        const acked = (a.acks ?? []).includes(myCallsign)
+        return (
+          <div key={`${a.sender}/${a.n}`} className={`alert-banner ${a.type}`}>
+            <div className="alert-text">
+              <b>{ALERT_LABEL[a.type] ?? a.type}</b> — {a.sender}
+              {a.text ? `: ${a.text}` : ''}
+              <span className="alert-acks">
+                приняли: {a.acks?.length ? a.acks.join(', ') : '—'}
+              </span>
+            </div>
+            <div className="alert-actions">
+              {!acked && (
+                <button onClick={() => onAck(a)}>
+                  Принял
+                </button>
+              )}
+              {(mine || isAdmin) && (
+                <button className="ghost" onClick={() => onClear(a)}>
+                  Отбой
+                </button>
+              )}
+            </div>
+          </div>
+        )
+      })}
     </div>
   )
-}
-
-export function alertFeedback(): void {
-  playAck()
 }

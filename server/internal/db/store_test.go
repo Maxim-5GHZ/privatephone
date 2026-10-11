@@ -162,11 +162,14 @@ func TestUndeliveredDeliveredFilters(t *testing.T) {
 		t.Fatalf("bob's backlog: want %v got %v", want, got)
 	}
 
-	if err := st.MarkDelivered(ctx, []string{"p-broadcast", "p-charlie", "missing-id"}); err != nil {
+	if err := st.MarkDelivered(ctx, []string{"p-broadcast", "p-charlie", "missing-id"}, "bob"); err != nil {
 		t.Fatal(err)
 	}
-	if err := st.MarkDelivered(ctx, nil); err != nil {
+	if err := st.MarkDelivered(ctx, nil, "bob"); err != nil {
 		t.Fatalf("empty ack must be a no-op: %v", err)
+	}
+	if err := st.MarkDelivered(ctx, []string{"p-broadcast"}, ""); err != nil {
+		t.Fatalf("anonymous ack must be a no-op: %v", err)
 	}
 	bp, err = st.UndeliveredPacketsFor(ctx, "bob")
 	if err != nil {
@@ -175,6 +178,14 @@ func TestUndeliveredDeliveredFilters(t *testing.T) {
 	after := ids(bp)
 	if !equal(after, []string{"p-bob", "p-group", "p-own"}) {
 		t.Fatalf("after ack want [p-bob p-group p-own] got %v", after)
+	}
+	// Per-recipient semantics: bob's ack must not wipe carol's backlog.
+	cp, err := st.UndeliveredPacketsFor(ctx, "carol")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := ids(cp), []string{"p-broadcast", "p-carol", "p-group", "p-own"}; !equal(got, want) {
+		t.Fatalf("carol backlog after bob's ack: want %v got %v", want, got)
 	}
 }
 
@@ -204,4 +215,93 @@ func equal(a, b []string) bool {
 		}
 	}
 	return true
+}
+
+// TestRecipientExactMatch guards routing precision. Callsigns are free-form
+// (cyrillic allowed, no charset validation), so the SQL LIKE prefilter must
+// not decide delivery: "_" and "%" inside a callsign are LIKE wildcards, and
+// only the exact Go-side check in visibleTo may admit a row.
+func TestRecipientExactMatch(t *testing.T) {
+	ctx := context.Background()
+	st, err := Open(t.TempDir(), testKey(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close(ctx)
+
+	addP := func(id, sender, recipient string) {
+		if err := st.AddPacket(ctx, id, sender, "message", "{}", "sig", id, recipient, time.Now().UnixMilli()); err != nil {
+			t.Fatal(err)
+		}
+	}
+	addP("p-bobby-group", "alice", `["bobby"]`)
+	addP("p-bob-group", "alice", `["bob"]`)
+	addP("p-bob-direct", "alice", "bob")
+	// LIKE wildcard trap: "b_b" must not match the group ["bxb"].
+	addP("p-bxb-group", "alice", `["bxb"]`)
+
+	ids := func(ps []Packet) []string {
+		var out []string
+		for _, p := range ps {
+			out = append(out, p.ID)
+		}
+		sort.Strings(out)
+		return out
+	}
+	bp, err := st.UndeliveredPacketsFor(ctx, "bob")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := ids(bp), []string{"p-bob-direct", "p-bob-group"}; !equal(got, want) {
+		t.Fatalf("bob backlog: want %v got %v", want, got)
+	}
+	by, err := st.UndeliveredPacketsFor(ctx, "bobby")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := ids(by), []string{"p-bobby-group"}; !equal(got, want) {
+		t.Fatalf("bobby backlog: want %v got %v", want, got)
+	}
+	wild, err := st.UndeliveredPacketsFor(ctx, "b_b")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(wild) != 0 {
+		t.Fatalf("b_b must see nothing (wildcard trap): %+v", wild)
+	}
+
+	if _, err := st.AddMessage(ctx, "alice", `["bobby"]`, "{}", "m1"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.AddMessage(ctx, "alice", `["bob"]`, "{}", "m2"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.AddMessage(ctx, "alice", `["bxb"]`, "{}", "m3"); err != nil {
+		t.Fatal(err)
+	}
+	msgs, err := st.ListMessagesFor(ctx, "bob")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, m := range msgs {
+		if m.Nonce == "m1" {
+			t.Fatalf("bob must not see bobby's group message: %+v", msgs)
+		}
+	}
+	seen := false
+	for _, m := range msgs {
+		if m.Nonce == "m2" {
+			seen = true
+		}
+	}
+	if !seen {
+		t.Fatalf("bob must see his own group message: %+v", msgs)
+	}
+	msgsW, err := st.ListMessagesFor(ctx, "b_b")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(msgsW) != 0 {
+		t.Fatalf("b_b must see nothing (wildcard trap): %+v", msgsW)
+	}
 }

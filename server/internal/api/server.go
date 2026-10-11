@@ -55,7 +55,6 @@ func New(st *db.Store, hub *ws.Hub, ver *protocol.Verifier, addr string) *Server
 	mux.HandleFunc("GET /api/v1/chats", s.signed(s.handleListChats))
 	mux.Handle("POST /api/v1/chats", s.signed(s.handleChatSubmit))
 	mux.Handle("POST /api/v1/ca/subscribers", s.signedAdmin(s.handleCreateSubscriber))
-	mux.Handle("POST /api/v1/ca/subscribers/key", s.signedAdmin(s.handleGetSubscriberKey))
 	mux.Handle("POST /api/v1/ca/revoke", s.signedAdmin(s.handleSubscriberStatus))
 	mux.Handle("GET /api/v1/journal", s.signedAdmin(s.handleJournalExport))
 	mux.Handle("POST /api/v1/journal/verify", s.signedAdmin(s.handleJournalVerify))

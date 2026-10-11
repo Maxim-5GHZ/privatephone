@@ -10,12 +10,11 @@
     "test": "vitest run"
   },
   "dependencies": {
-    "leaflet": "^1.9.4",
+    "ol": "^10.11.0",
     "react": "^19.0.0",
     "react-dom": "^19.0.0"
   },
   "devDependencies": {
-    "@types/leaflet": "^1.9.12",
     "@types/node": "^22.10.0",
     "@types/react": "^19.0.0",
     "@types/react-dom": "^19.0.0",

@@ -1,5 +1,10 @@
 #!/usr/bin/env bash
-# Download OSM tiles for a region into server/internal/web/tiles (embedded in the binary).
+# LEGACY build-time path: download OSM tiles for a region into
+# server/internal/web/tiles (embedded in the binary).
+# Preferred path is the runtime downloader: Admin UI -> Maps -> "Download area"
+# (POST /api/v1/admin/tiles/fetch), which stores into data/tiles/osm|sat/
+# and survives rebuilds. This script only fetches a 2x2 tile window per zoom
+# around LAT/LON (SPAN is accepted but currently unused).
 #
 # Usage:
 #   ZMIN=0 ZMAX=7 LAT=55.75 LON=37.62 SPAN=1.5 ./scripts/fetch_tiles.sh

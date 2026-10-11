@@ -2,6 +2,9 @@
 .env
 .env.local
 *.pem
+pp.local
+pp.key
+rescue.key
 data/
 
 # node

@@ -5,13 +5,18 @@ import {
   fetchJournal,
   fetchAdminStats,
   fetchSubscriberKey,
+  fetchTilesFetchStatus,
   fetchTilesStatus,
   importJournal,
+  startTilesFetch,
   uploadTile,
   uploadTilesBag,
   AdminStats,
   ImportReport,
   JournalEntry,
+  TileSource,
+  TilesFetchStatus,
+  TilesStatus,
   verifyJournal,
 } from '../api/client'
 import { fingerprint, isE2eeArmed } from '../crypto/e2ee'
@@ -706,13 +711,22 @@ function ChatsTab({
 }
 
 function MapsTab({ isAdmin }: { isAdmin: boolean }) {
-  const [status, setStatus] = useState<{ custom_tiles: number; custom_bytes: number } | null>(null)
+  const [status, setStatus] = useState<TilesStatus | null>(null)
   const [err, setErr] = useState<string | null>(null)
   const [busy, setBusy] = useState(false)
   const [z, setZ] = useState(6)
   const [x, setX] = useState(0)
   const [y, setY] = useState(0)
+  const [src, setSrc] = useState<TileSource>('osm')
   const [report, setReport] = useState<{ added: number; skipped: number } | null>(null)
+  // server-side fetch (node downloads while it has internet, serves offline)
+  const [fSrc, setFSrc] = useState<TileSource>('osm')
+  const [fLat, setFLat] = useState(55.75)
+  const [fLon, setFLon] = useState(37.62)
+  const [fZmin, setFZmin] = useState(0)
+  const [fZmax, setFZmax] = useState(12)
+  const [fSpan, setFSpan] = useState(0.5)
+  const [fetchSt, setFetchSt] = useState<TilesFetchStatus | null>(null)
 
   const load = async () => {
     try {
@@ -722,9 +736,24 @@ function MapsTab({ isAdmin }: { isAdmin: boolean }) {
       setErr((e as Error).message)
     }
   }
+  const loadFetch = async () => {
+    try {
+      setFetchSt(await fetchTilesFetchStatus())
+    } catch {
+      /* ignore transient */
+    }
+  }
   useEffect(() => {
-    if (isAdmin) void load()
+    if (isAdmin) {
+      void load()
+      void loadFetch()
+    }
   }, [])
+  useEffect(() => {
+    if (fetchSt?.state !== 'running') return
+    const t = setInterval(() => void loadFetch(), 2000)
+    return () => clearInterval(t)
+  }, [fetchSt?.state])
 
   if (!isAdmin) return <p className="muted">Загрузка карт доступна только оператору (admin).</p>
 
@@ -737,7 +766,7 @@ function MapsTab({ isAdmin }: { isAdmin: boolean }) {
     setBusy(true)
     setErr(null)
     try {
-      await uploadTile(z, x, y, file)
+      await uploadTile(z, x, y, file, src)
       await load()
     } catch (e) {
       setErr((e as Error).message)
@@ -752,8 +781,21 @@ function MapsTab({ isAdmin }: { isAdmin: boolean }) {
     setErr(null)
     setReport(null)
     try {
-      setReport(await uploadTilesBag(file))
+      setReport(await uploadTilesBag(file, src))
       await load()
+    } catch (e) {
+      setErr((e as Error).message)
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  const doFetch = async () => {
+    setBusy(true)
+    setErr(null)
+    try {
+      await startTilesFetch({ source: fSrc, lat: fLat, lon: fLon, zmin: fZmin, zmax: fZmax, span: fSpan })
+      await loadFetch()
     } catch (e) {
       setErr((e as Error).message)
     } finally {
@@ -777,12 +819,9 @@ function MapsTab({ isAdmin }: { isAdmin: boolean }) {
   return (
     <>
       <p className="muted">
-        Офлайн-карта: встроенные тайлы идут в бинарнике. Загруженные админом PNG-тайлы{' '}
-        <code>
-          {'{z}/{x}/{y}.png'}
-        </code>{' '}
-        (по одному или ZIP-архивом с деревом) перекрывают встроенные и сразу видны всем. Обновите страницу карты
-        после загрузки.
+        Офлайн-карта: встроенные тайлы идут в бинарнике. Два слоя — схема (OSM) и спутник (Esri):
+        <code>/tiles/osm|sat/{'{z}/{x}/{y}'}.png</code>. Загруженные админом PNG-тайлы (по одному, ZIP-архивом или
+        докачкой с сервера ниже) перекрывают встроенные и сразу видны всем. Обновите страницу карты после загрузки.
       </p>
       {err && <p className="error">{err}</p>}
       <div className="row">
@@ -795,12 +834,80 @@ function MapsTab({ isAdmin }: { isAdmin: boolean }) {
       </div>
       {status && (
         <p>
-          Загружено тайлов: <b>{status.custom_tiles}</b> · объём:{' '}
-          <b>{(status.custom_bytes / 1024).toFixed(1)} KiB</b>
+          Загружено тайлов: <b>{status.custom_tiles}</b> (схема: {status.by_source?.osm ?? '—'} · спутник:{' '}
+          {status.by_source?.sat ?? '—'}) · объём: <b>{(status.custom_bytes / 1024).toFixed(1)} KiB</b>
+        </p>
+      )}
+      <h3>Скачать область с сервера</h3>
+      <p className="muted">
+        Пока у узла есть интернет — сервер сам скачает тайлы области (схема OSM или спутник Esri) и будет раздавать
+        их всем офлайн. Лимиты: zoom 0..16, span 0.05..5°, не более ~20 тыс. файлов за раз.
+      </p>
+      <div className="row">
+        <label>
+          Источник{' '}
+          <select value={fSrc} onChange={(e) => setFSrc(e.target.value as TileSource)}>
+            <option value="osm">Схема (OSM)</option>
+            <option value="sat">Спутник (Esri)</option>
+          </select>
+        </label>
+        <label>
+          lat <input type="number" step={0.01} value={fLat} onChange={(e) => setFLat(Number(e.target.value))} />
+        </label>
+        <label>
+          lon <input type="number" step={0.01} value={fLon} onChange={(e) => setFLon(Number(e.target.value))} />
+        </label>
+      </div>
+      <div className="row">
+        <label>
+          zmin{' '}
+          <input type="number" min={0} max={16} value={fZmin} onChange={(e) => setFZmin(Number(e.target.value))} />
+        </label>
+        <label>
+          zmax{' '}
+          <input type="number" min={0} max={16} value={fZmax} onChange={(e) => setFZmax(Number(e.target.value))} />
+        </label>
+        <label>
+          span° <input type="number" step={0.1} value={fSpan} onChange={(e) => setFSpan(Number(e.target.value))} />
+        </label>
+        <button onClick={() => void doFetch()} disabled={busy || fetchSt?.state === 'running'}>
+          Скачать
+        </button>
+      </div>
+      {fetchSt && fetchSt.state !== 'idle' && (
+        <p className={fetchSt.state === 'error' ? 'error' : undefined}>
+          {fetchSt.state === 'running' && (
+            <>
+              Скачивание ({fetchSt.source}): <b>{fetchSt.done}</b> / {fetchSt.total}
+              <button className="ghost" onClick={() => void loadFetch()} style={{ marginLeft: 8 }}>
+                Обновить
+              </button>
+            </>
+          )}
+          {fetchSt.state === 'done' && (
+            <>
+              Готово ({fetchSt.source}): <b>{fetchSt.done}</b> / {fetchSt.total}.{' '}
+              <button className="ghost" onClick={() => void load()}>
+                Обновить статус
+              </button>
+            </>
+          )}
+          {fetchSt.state === 'error' && (
+            <>
+              Ошибка ({fetchSt.source}): {fetchSt.error} — скачано {fetchSt.done} / {fetchSt.total}
+            </>
+          )}
         </p>
       )}
       <h3>Один тайл</h3>
       <div className="row">
+        <label>
+          слой{' '}
+          <select value={src} onChange={(e) => setSrc(e.target.value as TileSource)}>
+            <option value="osm">Схема</option>
+            <option value="sat">Спутник</option>
+          </select>
+        </label>
         <label>
           z <input type="number" min={0} max={18} value={z} onChange={(e) => setZ(Number(e.target.value))} style={{ width: 64 }} />
         </label>
@@ -817,8 +924,8 @@ function MapsTab({ isAdmin }: { isAdmin: boolean }) {
       </div>
       <h3>ZIP-архив тайлов</h3>
       <p className="muted">
-        ZIP с файлами <code>z/x/y.png</code> (как в <code>scripts/fetch_tiles.sh</code> + zip). Лимит ~48 МБ запроса,
-        PNG до 512 KiB, z 0..18.
+        ZIP с файлами <code>z/x/y.png</code> (как в <code>scripts/fetch_tiles.sh</code> + zip) или с префиксом слоя{' '}
+        <code>osm|sat/z/x/y.png</code>. Лимит ~48 МБ запроса, PNG до 512 KiB, z 0..18.
       </p>
       <label className="file-pick">
         Выбрать tiles.zip

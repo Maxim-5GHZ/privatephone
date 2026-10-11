@@ -138,14 +138,17 @@ A: end() → ptt_end + закрытие всех PEER-подключений
 
 ## 6. Отображение карты и офлайн-тайлы
 
-- Тайлы `/{z}/{x}/{y}.png` берутся из embed `internal/web/tiles` (`web.go:13`,
-  `server.go:57`), проекция Web-Mercator (OSM). По умолчанию — процедурные
-  «заглушки» z0–5 (`cmd/gentiles`), реальные можно скачать: см.
-  `04-deployment`. Ш5. Нарезать тайлы.
-- Карта в браузере — Leaflet 1.9 (`L.map`, `L.tileLayer('/tiles/{z}/{x}/{y}.png')`,
-  `L.circleMarker`/`L.polygon`, попапы через `bindPopup` + React-формы).
-- Координаты маркеров/зон — `[lat, lon]` напрямую в Leaflet (WGS-84, без
-  проекционных преобразований).
+- Тайлы `/tiles/{osm|sat}/{z}/{x}/{y}.png`: сначала `data/tiles/` (custom/докачка),
+  потом embed `internal/web/tiles` (`web.go:13`, `server.go`), проекция Web-Mercator
+  (OSM). По умолчанию — процедурные «заглушки» z0–5 (`cmd/gentiles`,
+  `--skip-existing` не затирает скачанное); область докачивается сервером при
+  наличии интернета (`POST /api/v1/admin/tiles/fetch`, z0–16, cap ~20k). Нет
+  тайла — прозрачный fallback-PNG (карта не рвётся). См. `04-deployment`.
+- Карта в браузере — OpenLayers (`Map`/`View` EPSG:3857, два `TileLayer/XYZ`
+  osm+sat с переключателем, `VectorLayer` для маркеров/зон, попапы — React через
+  `Overlay`, attribution OSM/Esri обязательно).
+- Координаты маркеров/зон — `[lat, lon]` (WGS-84); в ol конвертируются через
+  `fromLonLat`/`toLonLat`.
 
 ## 7. Аутентификация браузера
 

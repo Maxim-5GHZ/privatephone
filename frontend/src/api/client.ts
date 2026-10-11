@@ -198,10 +198,40 @@ export async function deleteChat(id: string): Promise<void> {
 export interface TilesStatus {
   custom_tiles: number
   custom_bytes: number
+  by_source?: { osm: number; sat: number }
 }
 
 export async function fetchTilesStatus(): Promise<TilesStatus> {
   return (await apiGet('/api/v1/admin/tiles/status', 'tiles_status')) as TilesStatus
+}
+
+export type TileSource = 'osm' | 'sat'
+
+export interface TilesFetchStatus {
+  state: 'idle' | 'running' | 'done' | 'error'
+  source?: string
+  done: number
+  total: number
+  error?: string
+}
+
+export async function startTilesFetch(req: {
+  source: TileSource
+  lat: number
+  lon: number
+  zmin: number
+  zmax: number
+  span: number
+}): Promise<{ started: boolean; total: number; source: string }> {
+  return (await apiPost('/api/v1/admin/tiles/fetch', 'tiles_fetch', req)) as {
+    started: boolean
+    total: number
+    source: string
+  }
+}
+
+export async function fetchTilesFetchStatus(): Promise<TilesFetchStatus> {
+  return (await apiGet('/api/v1/admin/tiles/fetch/status', 'tiles_fetch_status')) as TilesFetchStatus
 }
 
 function arrayBufferToB64(buf: ArrayBuffer): string {
@@ -214,16 +244,16 @@ function arrayBufferToB64(buf: ArrayBuffer): string {
   return btoa(bin)
 }
 
-export async function uploadTile(z: number, x: number, y: number, file: Blob): Promise<void> {
+export async function uploadTile(z: number, x: number, y: number, file: Blob, source: TileSource = 'osm'): Promise<void> {
   const buf = await file.arrayBuffer()
   const png_b64 = arrayBufferToB64(buf)
-  await apiPost('/api/v1/admin/tiles', 'tiles_put', { z, x, y, png_b64 })
+  await apiPost('/api/v1/admin/tiles', 'tiles_put', { z, x, y, png_b64, source })
 }
 
-export async function uploadTilesBag(file: Blob): Promise<{ added: number; skipped: number }> {
+export async function uploadTilesBag(file: Blob, source: TileSource = 'osm'): Promise<{ added: number; skipped: number }> {
   const buf = await file.arrayBuffer()
   const zip_b64 = arrayBufferToB64(buf)
-  return (await apiPost('/api/v1/admin/tiles/bag', 'tiles_bag', { zip_b64 })) as { added: number; skipped: number }
+  return (await apiPost('/api/v1/admin/tiles/bag', 'tiles_bag', { zip_b64, source })) as { added: number; skipped: number }
 }
 
 export async function clearTiles(): Promise<void> {

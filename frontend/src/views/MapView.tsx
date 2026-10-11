@@ -1,6 +1,17 @@
 import { useEffect, useRef, useState } from 'react'
-import L from 'leaflet'
-import 'leaflet/dist/leaflet.css'
+import 'ol/ol.css'
+import Map from 'ol/Map'
+import View from 'ol/View'
+import TileLayer from 'ol/layer/Tile'
+import VectorLayer from 'ol/layer/Vector'
+import XYZ from 'ol/source/XYZ'
+import VectorSource from 'ol/source/Vector'
+import Feature from 'ol/Feature'
+import Point from 'ol/geom/Point'
+import Polygon from 'ol/geom/Polygon'
+import LineString from 'ol/geom/LineString'
+import { fromLonLat, toLonLat } from 'ol/proj'
+import { Style, Circle as CircleStyle, Fill, Stroke, Text } from 'ol/style'
 import { MARKER_COLORS, MARKER_LABEL, MARKER_LABELS, MARKER_QUICK, Marker, Zone, timeAgo } from '../types'
 
 interface Props {
@@ -22,6 +33,8 @@ interface ZoneDraft {
   color: string
 }
 
+type TileSource = 'osm' | 'sat'
+
 function parseZonePoints(z: Zone): [number, number][] {
   try {
     const arr = JSON.parse(z.points) as unknown
@@ -41,6 +54,31 @@ function parseZonePoints(z: Zone): [number, number][] {
   return []
 }
 
+function markerStyle(m: Marker, mine: boolean): Style {
+  const color = MARKER_COLORS[m.type] ?? MARKER_COLORS.other
+  return new Style({
+    image: new CircleStyle({
+      radius: mine ? 10 : 8,
+      fill: new Fill({ color: color + 'A6' }),
+      stroke: new Stroke({ color, width: 2 }),
+    }),
+    text: new Text({
+      text: m.sender,
+      offsetY: -16,
+      fill: new Fill({ color: '#fff' }),
+      stroke: new Stroke({ color: '#000', width: 3 }),
+      font: '12px sans-serif',
+    }),
+  })
+}
+
+function zoneStyle(z: Zone): Style {
+  return new Style({
+    fill: new Fill({ color: (z.color || '#ff3b30') + '2E' }),
+    stroke: new Stroke({ color: z.color || '#ff3b30', width: 2 }),
+  })
+}
+
 export function MapView({
   markers,
   zones,
@@ -54,10 +92,15 @@ export function MapView({
   onZoneDelete,
 }: Props) {
   const divRef = useRef<HTMLDivElement>(null)
-  const mapRef = useRef<L.Map | null>(null)
-  const layerRef = useRef<L.LayerGroup | null>(null)
-  const drawLayerRef = useRef<L.LayerGroup | null>(null)
+  const mapRef = useRef<Map | null>(null)
+  const markerSourceRef = useRef<VectorSource | null>(null)
+  const drawSourceRef = useRef<VectorSource | null>(null)
+  const osmLayerRef = useRef<TileLayer<XYZ> | null>(null)
+  const satLayerRef = useRef<TileLayer<XYZ> | null>(null)
   const drawingRef = useRef(false)
+  const drawPointsRef = useRef<[number, number][]>([])
+
+  const [base, setBase] = useState<TileSource>('osm')
   const [form, setForm] = useState<{ lat: number; lon: number } | null>(null)
   const [type, setType] = useState('enemy')
   const [desc, setDesc] = useState('')
@@ -68,143 +111,156 @@ export function MapView({
   const [drawing, setDrawing] = useState(false)
   const [draft, setDraft] = useState<ZoneDraft | null>(null)
   const [editingZone, setEditingZone] = useState<Zone | null>(null)
+  const [selectedMarker, setSelectedMarker] = useState<Marker | null>(null)
+  const [selectedZone, setSelectedZone] = useState<Zone | null>(null)
+
+  // latest callbacks/props for the once-registered map click handler (no stale closures)
+  const liveRef = useRef({ markers, zones, myCallsign, drawing, onDelete, onZoneDelete })
+  liveRef.current = { markers, zones, myCallsign, drawing, onDelete, onZoneDelete }
 
   useEffect(() => {
     if (!divRef.current || mapRef.current) return
-    const map = L.map(divRef.current, {
-      center: [55.7517, 37.6175],
-      zoom: 6,
-      minZoom: 0,
-      maxZoom: 18,
+    const osm = new TileLayer({
+      source: new XYZ({
+        url: '/tiles/osm/{z}/{x}/{y}.png',
+        maxZoom: 16,
+        attributions: '© OpenStreetMap contributors',
+      }),
     })
-    L.tileLayer('/tiles/{z}/{x}/{y}.png', { maxZoom: 18 }).addTo(map)
-    map.on('click', (e: L.LeafletMouseEvent) => {
-      if (drawingRef.current) {
-        addVertex([Number(e.latlng.lat.toFixed(6)), Number(e.latlng.lng.toFixed(6))])
+    const sat = new TileLayer({
+      source: new XYZ({
+        url: '/tiles/sat/{z}/{x}/{y}.png',
+        maxZoom: 16,
+        attributions: '© Esri World Imagery',
+      }),
+      visible: false,
+    })
+    const markerSource = new VectorSource()
+    const markersLayer = new VectorLayer({ source: markerSource, zIndex: 10 })
+    const drawSource = new VectorSource()
+    const drawLayer = new VectorLayer({
+      source: drawSource,
+      zIndex: 20,
+      style: new Style({
+        image: new CircleStyle({ radius: 4, fill: new Fill({ color: '#ff3b30' }) }),
+        stroke: new Stroke({ color: '#ff3b30', width: 2, lineDash: [6, 6] }),
+        fill: new Fill({ color: '#ff3b3026' }),
+      }),
+    })
+    const map = new Map({
+      target: divRef.current,
+      layers: [osm, sat, markersLayer, drawLayer],
+      view: new View({ center: fromLonLat([37.6175, 55.7517]), zoom: 6, minZoom: 0, maxZoom: 16 }),
+    })
+    map.on('click', (e) => {
+      const live = liveRef.current
+      const feats = map.getFeaturesAtPixel(e.pixel)
+      const hit = feats.find((f) => f.get('ppKind') === 'marker' || f.get('ppKind') === 'zone')
+      if (hit) {
+        const kind = hit.get('ppKind') as string
+        if (kind === 'marker') {
+          const key = hit.get('ppKey') as string
+          const mm = live.markers.find((x) => `${x.sender}|${x.n}` === key) ?? null
+          setSelectedMarker(mm)
+          setSelectedZone(null)
+        } else {
+          const key = hit.get('ppKey') as string
+          const zz = live.zones.find((x) => `${x.sender}|${x.n}` === key) ?? null
+          setSelectedZone(zz)
+          setSelectedMarker(null)
+        }
+        setForm(null)
         return
       }
+      setSelectedMarker(null)
+      setSelectedZone(null)
+      if (live.drawing) {
+        const [lon, lat] = toLonLat(e.coordinate)
+        addVertex([Number(lat.toFixed(6)), Number(lon.toFixed(6))])
+        return
+      }
+      const [lon, lat] = toLonLat(e.coordinate)
       setEditing(null)
       setEditingZone(null)
-      setForm({ lat: Number(e.latlng.lat.toFixed(6)), lon: Number(e.latlng.lng.toFixed(6)) })
+      setForm({ lat: Number(lat.toFixed(6)), lon: Number(lon.toFixed(6)) })
     })
     mapRef.current = map
-    layerRef.current = L.layerGroup().addTo(map)
-    drawLayerRef.current = L.layerGroup().addTo(map)
+    markerSourceRef.current = markerSource
+    drawSourceRef.current = drawSource
+    osmLayerRef.current = osm
+    satLayerRef.current = sat
     return () => {
-      map.remove()
+      map.setTarget(undefined)
       mapRef.current = null
-      layerRef.current = null
-      drawLayerRef.current = null
+      markerSourceRef.current = null
+      drawSourceRef.current = null
+      osmLayerRef.current = null
+      satLayerRef.current = null
     }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
 
   const addVertex = (pt: [number, number]) => {
-    drawPoints.current.push(pt)
+    drawPointsRef.current.push(pt)
     redrawPreview()
   }
 
-  const drawPoints = useRef<[number, number][]>([])
-
   const redrawPreview = () => {
-    const layer = drawLayerRef.current
-    if (!layer) return
-    layer.clearLayers()
-    const pts = drawPoints.current
-    for (const p of pts) {
-      L.circleMarker(p, { radius: 4, color: '#ff3b30', fillColor: '#ff3b30', fillOpacity: 1 }).addTo(layer)
-    }
-    if (pts.length > 1) {
-      L.polyline(pts, { color: '#ff3b30', weight: 2, dashArray: '6 6' }).addTo(layer)
-    }
-    if (pts.length >= 3) {
-      L.polygon([...pts, pts[0]], { color: '#ff3b30', fillColor: '#ff3b30', fillOpacity: 0.15 }).addTo(layer)
-    }
+    const src = drawSourceRef.current
+    if (!src) return
+    src.clear()
+    const pts = drawPointsRef.current.map(([lat, lon]) => fromLonLat([lon, lat]))
+    if (pts.length === 0) return
+    for (const p of pts) src.addFeature(new Feature(new Point(p)))
+    if (pts.length > 1) src.addFeature(new Feature(new LineString(pts)))
+    if (pts.length >= 3) src.addFeature(new Feature(new Polygon([[...pts, pts[0]]])));
   }
 
   useEffect(() => {
     drawingRef.current = drawing
-    drawPoints.current = []
-    drawLayerRef.current?.clearLayers()
+    drawPointsRef.current = []
+    drawSourceRef.current?.clear()
+    if (!drawing) setDraft(null)
   }, [drawing])
 
   useEffect(() => {
-    const layer = layerRef.current
-    if (!layer) return
-    layer.clearLayers()
+    osmLayerRef.current?.setVisible(base === 'osm')
+    satLayerRef.current?.setVisible(base === 'sat')
+  }, [base])
+
+  // rebuild vector features from props (clears stale popups implicitly)
+  useEffect(() => {
+    const src = markerSourceRef.current
+    if (!src) return
+    src.clear()
     const now = Date.now()
     for (const m of markers) {
       if (hideOld && m.created_at && now - new Date(m.created_at).getTime() > 24 * 3600_000) continue
-      const color = MARKER_COLORS[m.type] ?? MARKER_COLORS.other
-      const mine = m.sender === myCallsign
-      const c = L.circleMarker([m.lat, m.lon], {
-        radius: mine ? 10 : 8,
-        color,
-        fillColor: color,
-        fillOpacity: 0.65,
-        weight: 2,
-      })
-      const label = MARKER_LABEL[m.type] ?? m.type
-      const actions = mine
-        ? `<button class="pop-btn" data-act="edit" data-n="${escapeHtml(m.n)}">изменить</button> ` +
-          `<button class="pop-btn" data-act="del" data-n="${escapeHtml(m.n)}">удалить</button>`
-        : ''
-      c.bindPopup(
-        `<b>${escapeHtml(m.sender)}</b> — ${escapeHtml(label)}<br>` +
-          `${escapeHtml(m.desc || '')}<br><span class="muted">${timeAgo(m.created_at)}</span>${actions}`,
-      )
-      c.on('popupopen', () => {
-        document.querySelectorAll<HTMLButtonElement>('.pop-btn').forEach((b) => {
-          b.onclick = () => {
-            const act = b.dataset.act
-            const n = b.dataset.n ?? ''
-            const mm = markers.find((x) => x.sender === myCallsign && x.n === n)
-            if (!mm) return
-            if (act === 'edit') {
-              setEditing(mm)
-              setEditType(mm.type)
-              setEditDesc(mm.desc)
-            } else if (act === 'del') {
-              onDelete(mm)
-            }
-          }
-        })
-      })
-      c.bindTooltip(m.sender, { direction: 'top', opacity: 0.9 })
-      c.addTo(layer)
+      const f = new Feature({ geometry: new Point(fromLonLat([m.lon, m.lat])) })
+      f.set('ppKind', 'marker')
+      f.set('ppKey', `${m.sender}|${m.n}`)
+      f.setStyle(markerStyle(m, m.sender === myCallsign))
+      src.addFeature(f)
     }
-
     for (const z of zones) {
       const pts = parseZonePoints(z)
       if (pts.length < 3) continue
-      const mine = z.sender === myCallsign
-      const poly = L.polygon(pts, {
-        color: z.color,
-        weight: 2,
-        fillColor: z.color,
-        fillOpacity: 0.18,
-      })
-      const actions = mine
-        ? `<button class="pop-btn" data-zact="edit" data-n="${escapeHtml(z.n)}">изменить</button> ` +
-          `<button class="pop-btn" data-zact="del" data-n="${escapeHtml(z.n)}">удалить</button>`
-        : ''
-      poly.bindPopup(
-        `<b>${escapeHtml(z.name)}</b> — ${escapeHtml(z.sender)}<br>` +
-          `<span class="muted">${pts.length} точек · ${timeAgo(z.created_at)}</span>${actions}`,
-      )
-      poly.on('popupopen', () => {
-        document.querySelectorAll<HTMLButtonElement>('[data-zact]').forEach((b) => {
-          b.onclick = () => {
-            const act = b.dataset.zact
-            const n = b.dataset.n ?? ''
-            const zz = zones.find((x) => x.sender === myCallsign && x.n === n)
-            if (!zz) return
-            if (act === 'edit') setEditingZone(zz)
-            else if (act === 'del') onZoneDelete(zz)
-          }
-        })
-      })
-      poly.addTo(layer)
+      const ring = pts.map(([lat, lon]) => fromLonLat([lon, lat]))
+      ring.push(ring[0])
+      const f = new Feature({ geometry: new Polygon([ring]) })
+      f.set('ppKind', 'zone')
+      f.set('ppKey', `${z.sender}|${z.n}`)
+      f.setStyle(zoneStyle(z))
+      src.addFeature(f)
     }
+    // drop selection if the object vanished
+    if (selectedMarker && !markers.some((x) => x.sender === selectedMarker.sender && x.n === selectedMarker.n)) {
+      setSelectedMarker(null)
+    }
+    if (selectedZone && !zones.some((x) => x.sender === selectedZone.sender && x.n === selectedZone.n)) {
+      setSelectedZone(null)
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [markers, zones, myCallsign, hideOld])
 
   const quickAdd = (qt: string) => {
@@ -227,7 +283,7 @@ export function MapView({
   }
 
   const closeDrawing = () => {
-    const pts = drawPoints.current
+    const pts = drawPointsRef.current
     if (pts.length < 3) {
       setDrawing(false)
       return
@@ -237,8 +293,8 @@ export function MapView({
 
   const cancelDrawing = () => {
     setDrawing(false)
-    drawPoints.current = []
-    drawLayerRef.current?.clearLayers()
+    drawPointsRef.current = []
+    drawSourceRef.current?.clear()
   }
 
   const saveZone = () => {
@@ -246,8 +302,8 @@ export function MapView({
     onZoneSubmit(draft.points, draft.name || 'Зона', draft.color)
     setDraft(null)
     setDrawing(false)
-    drawPoints.current = []
-    drawLayerRef.current?.clearLayers()
+    drawPointsRef.current = []
+    drawSourceRef.current?.clear()
   }
 
   const saveZoneEdit = () => {
@@ -256,10 +312,17 @@ export function MapView({
     setEditingZone(null)
   }
 
+  const selMarkerMine = selectedMarker?.sender === myCallsign
+  const selZoneMine = selectedZone?.sender === myCallsign
+
   return (
     <div className="map-wrap">
       <div ref={divRef} className="map" />
       <div className="map-toolbar">
+        <select value={base} onChange={(e) => setBase(e.target.value as TileSource)} title="Слой карты">
+          <option value="osm">Схема</option>
+          <option value="sat">Спутник</option>
+        </select>
         <button className={drawing ? 'active' : ''} onClick={() => setDrawing((d) => !d)}>
           Полигон
         </button>
@@ -273,6 +336,82 @@ export function MapView({
           <input type="checkbox" checked={hideOld} onChange={(e) => setHideOld(e.target.checked)} /> скрыть старые (&gt;24ч)
         </label>
       </div>
+
+      {selectedMarker && (
+        <div className="marker-form">
+          <h3>
+            {selectedMarker.sender} — {MARKER_LABEL[selectedMarker.type] ?? selectedMarker.type}
+          </h3>
+          <p className="muted">
+            {selectedMarker.desc || '—'}
+            <br />
+            <span>{timeAgo(selectedMarker.created_at)}</span>
+          </p>
+          <div className="row">
+            {selMarkerMine && (
+              <>
+                <button
+                  onClick={() => {
+                    setEditing(selectedMarker)
+                    setEditType(selectedMarker.type)
+                    setEditDesc(selectedMarker.desc)
+                    setSelectedMarker(null)
+                  }}
+                >
+                  Изменить
+                </button>
+                <button
+                  className="ghost"
+                  onClick={() => {
+                    onDelete(selectedMarker)
+                    setSelectedMarker(null)
+                  }}
+                >
+                  Удалить
+                </button>
+              </>
+            )}
+            <button className="ghost" onClick={() => setSelectedMarker(null)}>
+              Закрыть
+            </button>
+          </div>
+        </div>
+      )}
+
+      {selectedZone && !selectedMarker && (
+        <div className="marker-form">
+          <h3>{selectedZone.name}</h3>
+          <p className="muted">
+            {selectedZone.sender} · {parseZonePoints(selectedZone).length} точек · {timeAgo(selectedZone.created_at)}
+          </p>
+          <div className="row">
+            {selZoneMine && (
+              <>
+                <button
+                  onClick={() => {
+                    setEditingZone(selectedZone)
+                    setSelectedZone(null)
+                  }}
+                >
+                  Изменить
+                </button>
+                <button
+                  className="ghost"
+                  onClick={() => {
+                    onZoneDelete(selectedZone)
+                    setSelectedZone(null)
+                  }}
+                >
+                  Удалить
+                </button>
+              </>
+            )}
+            <button className="ghost" onClick={() => setSelectedZone(null)}>
+              Закрыть
+            </button>
+          </div>
+        </div>
+      )}
 
       {drawing && (
         <div className="draw-help">
@@ -379,8 +518,4 @@ export function MapView({
       )}
     </div>
   )
-}
-
-function escapeHtml(s: string): string {
-  return s.replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c]!)
 }

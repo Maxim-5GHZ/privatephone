@@ -9,6 +9,7 @@ import (
 	"log"
 	"net/http"
 	"net/url"
+	"sync"
 	"time"
 
 	"privatephone/server/internal/db"
@@ -26,6 +27,9 @@ type Server struct {
 	srv     *http.Server
 	tlsCert string
 	tlsKey  string
+
+	fetchMu sync.Mutex
+	fetcher *fetchJob
 }
 
 // WithTLS switches the node to HTTPS/WSS using the given certificate files.
@@ -61,6 +65,8 @@ func New(st *db.Store, hub *ws.Hub, ver *protocol.Verifier, addr string) *Server
 	mux.Handle("POST /api/v1/admin/tiles", s.signedAdmin(s.handleTilePut))
 	mux.Handle("POST /api/v1/admin/tiles/bag", s.signedAdminLarge(maxBagBody, s.handleTilesBag))
 	mux.Handle("POST /api/v1/admin/tiles/clear", s.signedAdmin(s.handleTilesClear))
+	mux.Handle("POST /api/v1/admin/tiles/fetch", s.signedAdmin(s.handleTilesFetch))
+	mux.Handle("GET /api/v1/admin/tiles/fetch/status", s.signedAdmin(s.handleTilesFetchStatus))
 
 	mux.HandleFunc("/tiles/", s.serveTiles)
 	mux.Handle("/", s.spa(web.Dist()))

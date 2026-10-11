@@ -123,13 +123,20 @@ sudo scripts/install_ca.sh data/ca.crt   # Linux/macOS; Windows: Import-Certific
 ## 7. Офлайн-карта: заглушки и реальные тайлы
 
 - `make gentiles` — процедурные PNG 256×256, z0–5, терраформ из широтной зоны +
-  детерминированная вариация от хэша `z/x/y` (`cmd/gentiles/main.go:71-99`).
-- Реальные тайлы OSM комнаты:
-  ```
-  ZMIN=0 ZMAX=7 LAT=55.75 LON=37.62 SPAN=1.5 make tiles
-  ```
-  `scripts/fetch_tiles.sh`: качает `tile.openstreetmap.org/{z}/{x}/{y}.png`
-  (не перекачивает существующие), после — `make build` (перевстраивание в бинарь).
+  детерминированная вариация от хэша `z/x/y` (`cmd/gentiles/main.go:71-99`,
+  флаг `--skip-existing` не затирает скачанные тайлы при пересборке).
+- **Штатный путь — докачка сервером** (узел с интернетом качает и раздаёт всем
+  офлайн): вкладка «Админ» → «Карта» → «Скачать область» (источник схема OSM /
+  спутник Esri, lat/lon/span/zmin/zmax) либо REST:
+  `POST /api/v1/admin/tiles/fetch`, прогресс — `GET
+  /api/v1/admin/tiles/fetch/status`. Хранилище — `data/tiles/osm|sat/`,
+  переживает пересборки. Лимиты: zoom 0–16, span 0.05–5°, ~20k файлов/задача,
+  троттлинг по OSM usage policy (UA `privatephone/1.0`).
+- Legacy build-time путь (редко нужен): `ZMIN=0 ZMAX=7 LAT=55.75 LON=37.62
+  SPAN=1.5 make tiles` → `scripts/fetch_tiles.sh` (только OSM; качает 2×2 тайла
+  на зум вокруг центра, не перекачивает существующие), после — `make build`.
+  Для заливки готовых наборов есть также поштучный `tiles_put` и ZIP-импорт
+  `tiles_bag` (`{z}/{x}/{y}.png`, опц. префикс `osm|sat/`).
 
 ## 8. Эксплуатация: подкоманды бинаря
 

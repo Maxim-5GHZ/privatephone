@@ -26,8 +26,8 @@ if [ ! -d "server/internal/web/dist/assets" ]; then
   cp -r frontend/dist/* server/internal/web/dist/
 fi
 
-# 3. offline placeholder tiles for the sample embed
-(cd server && go run ./cmd/gentiles)
+# 3. offline placeholder tiles for the sample embed (keep downloaded real ones)
+(cd server && go run ./cmd/gentiles --skip-existing)
 
 # 4. run Go backend
 echo "[dev] backend  http://localhost:$PORT"

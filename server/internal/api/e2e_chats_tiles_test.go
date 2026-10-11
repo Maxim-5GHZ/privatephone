@@ -109,6 +109,79 @@ func TestChatMessagingVisibility(t *testing.T) {
 	}
 }
 
+func TestChatUpdateDelete(t *testing.T) {
+	ctx := setup(t)
+	bob := register(t, ctx, "bob", "operator")
+
+	p := signPacket(t, ctx, "admin", "chat_create", map[string]any{"name": "Штаб", "members": []string{"bob"}})
+	resp, b := doSigned(t, ctx, http.MethodPost, "/api/v1/chats", p)
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("create: %d %s", resp.StatusCode, b)
+	}
+	var chat struct {
+		ID string `json:"id"`
+	}
+	if err := json.Unmarshal(b, &chat); err != nil {
+		t.Fatal(err)
+	}
+
+	// operator cannot update
+	po := signAs(t, "bob", bob, "chat_update", map[string]any{"id": chat.ID, "name": "X", "members": []string{"bob"}})
+	respO, _ := doSigned(t, ctx, http.MethodPost, "/api/v1/chats", po)
+	if respO.StatusCode != http.StatusForbidden {
+		t.Fatalf("operator update must be 403, got %d", respO.StatusCode)
+	}
+
+	// admin updates
+	pu := signPacket(t, ctx, "admin", "chat_update", map[string]any{"id": chat.ID, "name": "Штаб-2", "members": []string{"bob", "admin"}})
+	respU, bU := doSigned(t, ctx, http.MethodPost, "/api/v1/chats", pu)
+	if respU.StatusCode != http.StatusOK {
+		t.Fatalf("update: %d %s", respU.StatusCode, bU)
+	}
+	var upd struct {
+		Name string `json:"name"`
+	}
+	if err := json.Unmarshal(bU, &upd); err != nil {
+		t.Fatal(err)
+	}
+	if upd.Name != "Штаб-2" {
+		t.Fatalf("name not updated: %s", bU)
+	}
+
+	// bad update rejected
+	pb := signPacket(t, ctx, "admin", "chat_update", map[string]any{"id": chat.ID, "name": "", "members": []string{"bob"}})
+	respB, _ := doSigned(t, ctx, http.MethodPost, "/api/v1/chats", pb)
+	if respB.StatusCode != http.StatusBadRequest {
+		t.Fatalf("empty name must be 400, got %d", respB.StatusCode)
+	}
+
+	// update ghost → 400 (not found)
+	pg := signPacket(t, ctx, "admin", "chat_update", map[string]any{"id": "chat:nope", "name": "N", "members": []string{"bob"}})
+	respG, _ := doSigned(t, ctx, http.MethodPost, "/api/v1/chats", pg)
+	if respG.StatusCode != http.StatusBadRequest {
+		t.Fatalf("ghost update must be 400, got %d", respG.StatusCode)
+	}
+
+	// operator cannot delete
+	pd := signAs(t, "bob", bob, "chat_delete", map[string]any{"id": chat.ID})
+	respD, _ := doSigned(t, ctx, http.MethodPost, "/api/v1/chats", pd)
+	if respD.StatusCode != http.StatusForbidden {
+		t.Fatalf("operator delete must be 403, got %d", respD.StatusCode)
+	}
+
+	// admin deletes; second delete rejected
+	pdel := signPacket(t, ctx, "admin", "chat_delete", map[string]any{"id": chat.ID})
+	respDel, _ := doSigned(t, ctx, http.MethodPost, "/api/v1/chats", pdel)
+	if respDel.StatusCode != http.StatusOK {
+		t.Fatalf("delete: %d", respDel.StatusCode)
+	}
+	pdel2 := signPacket(t, ctx, "admin", "chat_delete", map[string]any{"id": chat.ID})
+	respDel2, _ := doSigned(t, ctx, http.MethodPost, "/api/v1/chats", pdel2)
+	if respDel2.StatusCode != http.StatusBadRequest {
+		t.Fatalf("double delete must be 400, got %d", respDel2.StatusCode)
+	}
+}
+
 func TestTilesPutStatusClear(t *testing.T) {
 	ctx := setup(t)
 	// 1x1 PNG

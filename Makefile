@@ -34,7 +34,7 @@ ui: ## build React frontend and embed into the server package
 	cp -r "$(ROOT)/frontend/dist"/* "$(ROOT)/server/internal/web/dist/"
 
 gentiles: ## generate offline placeholder tiles (z0-5) for the embedded map
-	cd "$(ROOT)/server" && $(GO) run ./cmd/gentiles
+	cd "$(ROOT)/server" && $(GO) run ./cmd/gentiles --skip-existing
 
 ## --- Build -------------------------------------------------------------------
 

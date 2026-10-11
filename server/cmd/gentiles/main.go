@@ -22,6 +22,7 @@ const tileSize = 256
 func main() {
 	out := flag.String("out", "internal/web/tiles", "output directory (relative to CWD)")
 	maxZoom := flag.Int("z", 5, "maximum zoom level")
+	skipExisting := flag.Bool("skip-existing", false, "do not overwrite existing non-empty tiles (preserves downloaded real tiles)")
 	flag.Parse()
 
 	for z := 0; z <= *maxZoom; z++ {
@@ -30,6 +31,11 @@ func main() {
 		for x := 0; x < n; x++ {
 			for y := 0; y < n; y++ {
 				path := filepath.Join(*out, fmt.Sprintf("%d/%d/%d.png", z, x, y))
+				if *skipExisting {
+					if st, err := os.Stat(path); err == nil && st.Size() > 0 {
+						continue
+					}
+				}
 				if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 					log.Fatal(err)
 				}

@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"io/fs"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -28,17 +29,29 @@ var pngMagic = []byte{0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A}
 
 func tilesDir(dataDir string) string { return filepath.Join(dataDir, "tiles") }
 
-// handleTilesStatus reports how many custom (uploaded) tiles override the
-// embedded offline map.
+// handleTilesStatus reports how many custom (uploaded/fetched) tiles override
+// the embedded offline map, broken down by source.
 func (s *Server) handleTilesStatus(w http.ResponseWriter, r *http.Request, ev *protocol.Envelope) {
 	count, size, err := countCustomTiles(s.st.DataDir())
 	if err != nil {
 		writeErr(w, http.StatusInternalServerError, "tiles status")
 		return
 	}
+	bySource := map[string]int{"osm": 0, "sat": 0}
+	_ = filepath.Walk(tilesSourceDir(s.st.DataDir(), tileSourceSAT), func(path string, info os.FileInfo, err error) error {
+		if err == nil && !info.IsDir() && strings.HasSuffix(strings.ToLower(info.Name()), ".png") {
+			bySource["sat"]++
+		}
+		return nil
+	})
+	bySource["osm"] = count - bySource["sat"]
+	if bySource["osm"] < 0 {
+		bySource["osm"] = 0
+	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"custom_tiles": count,
 		"custom_bytes": size,
+		"by_source":    bySource,
 	})
 }
 
@@ -82,37 +95,26 @@ func validTileCoord(z, x, y int) bool {
 	return x < limit && y < limit
 }
 
-func tilePath(dataDir string, z, x, y int) (string, error) {
-	if !validTileCoord(z, x, y) {
-		return "", fmt.Errorf("bad tile coords z=%d x=%d y=%d", z, x, y)
-	}
-	p := filepath.Join(tilesDir(dataDir), strconv.Itoa(z), strconv.Itoa(x), strconv.Itoa(y)+".png")
-	// containment: must stay under tilesDir
-	absRoot, err := filepath.Abs(tilesDir(dataDir))
-	if err != nil {
-		return "", err
-	}
-	absP, err := filepath.Abs(p)
-	if err != nil {
-		return "", err
-	}
-	if absP != absRoot && !strings.HasPrefix(absP, absRoot+string(os.PathSeparator)) {
-		return "", fmt.Errorf("tile path escapes storage")
-	}
-	return p, nil
-}
-
 // handleTilePut stores a single custom tile (admin only).
-// Body: {"z":int,"x":int,"y":int,"png_b64":"..."}
+// Body: {"z":int,"x":int,"y":int,"png_b64":"...","source":"osm|sat"}
+// source defaults to "osm" (legacy flat layout).
 func (s *Server) handleTilePut(w http.ResponseWriter, r *http.Request, ev *protocol.Envelope) {
 	var req struct {
-		Z    int    `json:"z"`
-		X    int    `json:"x"`
-		Y    int    `json:"y"`
-		PngB string `json:"png_b64"`
+		Z     int    `json:"z"`
+		X     int    `json:"x"`
+		Y     int    `json:"y"`
+		PngB  string `json:"png_b64"`
+		Src   string `json:"source"`
 	}
 	if err := json.Unmarshal(ev.Data, &req); err != nil {
 		writeErr(w, http.StatusBadRequest, "bad tile JSON")
+		return
+	}
+	if req.Src == "" {
+		req.Src = tileSourceOSM
+	}
+	if !validTileSource(req.Src) {
+		writeErr(w, http.StatusBadRequest, "source must be osm|sat")
 		return
 	}
 	raw, err := base64.StdEncoding.DecodeString(req.PngB)
@@ -128,7 +130,7 @@ func (s *Server) handleTilePut(w http.ResponseWriter, r *http.Request, ev *proto
 		writeErr(w, http.StatusBadRequest, "not a PNG image")
 		return
 	}
-	p, err := tilePath(s.st.DataDir(), req.Z, req.X, req.Y)
+	p, err := tilePathSource(s.st.DataDir(), req.Src, req.Z, req.X, req.Y)
 	if err != nil {
 		writeErr(w, http.StatusBadRequest, err.Error())
 		return
@@ -141,17 +143,26 @@ func (s *Server) handleTilePut(w http.ResponseWriter, r *http.Request, ev *proto
 		writeErr(w, http.StatusInternalServerError, "tiles write")
 		return
 	}
-	writeJSON(w, http.StatusCreated, map[string]any{"z": req.Z, "x": req.X, "y": req.Y, "bytes": len(raw)})
+	writeJSON(w, http.StatusCreated, map[string]any{"z": req.Z, "x": req.X, "y": req.Y, "source": req.Src, "bytes": len(raw)})
 }
 
 // handleTilesBag imports a ZIP with {z}/{x}/{y}.png tree (admin only).
-// Body: {"zip_b64":"..."} — e.g. produced by scripts/fetch_tiles.sh + zip.
+// Body: {"zip_b64":"...","source":"osm|sat"} — e.g. produced by scripts/fetch_tiles.sh + zip.
+// Entries may also carry a source prefix: {source}/{z}/{x}/{y}.png.
 func (s *Server) handleTilesBag(w http.ResponseWriter, r *http.Request, ev *protocol.Envelope) {
 	var req struct {
 		ZipB string `json:"zip_b64"`
+		Src  string `json:"source"`
 	}
 	if err := json.Unmarshal(ev.Data, &req); err != nil || req.ZipB == "" {
 		writeErr(w, http.StatusBadRequest, "zip_b64 required")
+		return
+	}
+	if req.Src == "" {
+		req.Src = tileSourceOSM
+	}
+	if !validTileSource(req.Src) {
+		writeErr(w, http.StatusBadRequest, "source must be osm|sat")
 		return
 	}
 	raw, err := base64.StdEncoding.DecodeString(req.ZipB)
@@ -177,6 +188,16 @@ func (s *Server) handleTilesBag(w http.ResponseWriter, r *http.Request, ev *prot
 			continue
 		}
 		parts := strings.Split(clean, "/")
+		src := req.Src
+		if len(parts) == 4 {
+			// optional {source}/{z}/{x}/{y}.png prefix wins over request source
+			if !validTileSource(parts[0]) {
+				skipped++
+				continue
+			}
+			src = parts[0]
+			parts = parts[1:]
+		}
 		if len(parts) != 3 {
 			skipped++
 			continue
@@ -219,7 +240,7 @@ func (s *Server) handleTilesBag(w http.ResponseWriter, r *http.Request, ev *prot
 			skipped++
 			continue
 		}
-		p, err := tilePath(s.st.DataDir(), z, x, y)
+		p, err := tilePathSource(s.st.DataDir(), src, z, x, y)
 		if err != nil {
 			skipped++
 			continue
@@ -293,22 +314,81 @@ func (s *Server) decodeEnvelopeWithLimit(r *http.Request, limit int) (*protocol.
 	return ev, nil
 }
 
-// serveTiles serves custom uploaded tiles first, then the embedded offline set.
+// fallbackTile is a 1x1 transparent PNG served (200, no-store) when neither
+// custom nor embedded tiles have the requested tile — keeps the map from
+// showing broken-image holes and 404 storms at zooms without data.
+var fallbackTile = []byte{
+	0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D,
+	0x49, 0x48, 0x44, 0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01,
+	0x08, 0x06, 0x00, 0x00, 0x00, 0x1F, 0x15, 0xC4, 0x89, 0x00, 0x00, 0x00,
+	0x0D, 0x49, 0x44, 0x41, 0x54, 0x78, 0x9C, 0x63, 0x60, 0x18, 0x05, 0xA3,
+	0x60, 0x14, 0x8C, 0x02, 0x00, 0x00, 0x0D, 0x00, 0x01, 0xE2, 0x63, 0x1E,
+	0x12, 0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4E, 0x44, 0xAE, 0x42, 0x60,
+	0x82,
+}
+
+func serveFallbackTile(w http.ResponseWriter) {
+	w.Header().Set("Content-Type", "image/png")
+	w.Header().Set("Cache-Control", "no-store")
+	_, _ = w.Write(fallbackTile)
+}
+
+// serveTiles serves custom tiles first (data/tiles/{source}/...),
+// then the embedded offline set (legacy flat {z}/{x}/{y}.png for osm),
+// then a transparent fallback PNG so missing zooms don't break the map.
+//
+// URL scheme: /tiles/{source}/{z}/{x}/{y}.png (source = osm|sat);
+// legacy /tiles/{z}/{x}/{y}.png is treated as osm.
 func (s *Server) serveTiles(w http.ResponseWriter, r *http.Request) {
 	rel := strings.TrimPrefix(r.URL.Path, "/tiles/")
 	rel = filepath.Clean(rel)
 	if strings.HasPrefix(rel, "..") || filepath.IsAbs(rel) {
-		http.NotFound(w, r)
+		serveFallbackTile(w)
+		return
+	}
+	parts := strings.Split(filepath.ToSlash(rel), "/")
+	src := tileSourceOSM
+	if len(parts) == 4 {
+		if !validTileSource(parts[0]) {
+			serveFallbackTile(w)
+			return
+		}
+		src = parts[0]
+		parts = parts[1:]
+	}
+	if len(parts) != 3 {
+		serveFallbackTile(w)
+		return
+	}
+	z, err1 := strconv.Atoi(parts[0])
+	x, err2 := strconv.Atoi(parts[1])
+	y, err3 := strconv.Atoi(strings.TrimSuffix(parts[2], ".png"))
+	if err1 != nil || err2 != nil || err3 != nil || !validTileCoord(z, x, y) ||
+		!strings.HasSuffix(strings.ToLower(parts[2]), ".png") {
+		serveFallbackTile(w)
 		return
 	}
 	// custom override
-	custom := filepath.Join(tilesDir(s.st.DataDir()), filepath.FromSlash(rel))
+	custom := filepath.Join(tilesSourceDir(s.st.DataDir(), src),
+		strconv.Itoa(z), strconv.Itoa(x), strconv.Itoa(y)+".png")
 	if data, err := os.ReadFile(custom); err == nil {
 		w.Header().Set("Content-Type", "image/png")
 		w.Header().Set("Cache-Control", "public, max-age=86400")
 		_, _ = w.Write(data)
 		return
 	}
-	// embedded fallback
-	http.StripPrefix("/tiles/", http.FileServer(http.FS(web.Tiles()))).ServeHTTP(w, r)
+	if src == tileSourceOSM {
+		// embedded fallback (legacy flat layout); transparent PNG when
+		// the zoom isn't covered by the bundle instead of a bare 404.
+		embedRel := strconv.Itoa(z) + "/" + strconv.Itoa(x) + "/" + strconv.Itoa(y) + ".png"
+		if data, err := fs.ReadFile(web.Tiles(), embedRel); err == nil {
+			w.Header().Set("Content-Type", "image/png")
+			w.Header().Set("Cache-Control", "public, max-age=86400")
+			_, _ = w.Write(data)
+			return
+		}
+		serveFallbackTile(w)
+		return
+	}
+	serveFallbackTile(w)
 }

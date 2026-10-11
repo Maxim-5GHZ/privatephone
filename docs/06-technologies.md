@@ -16,7 +16,7 @@
 ┌─────────────── БРАУЗЕР (React SPA) ─────────────────────┐
 │ React 19 + react-dom (createRoot)                       │
 │ Vite 6 + TypeScript 5.7 (build/dev)                     │
-│ Leaflet 1.9 (карта, офлайн-тайлы)                       │
+│ OpenLayers (карта, офлайн-тайлы osm/sat)                  │
 │ WebCrypto (ECDSA-подпись, ECDH/HKDF/AES-GCM E2EE)       │
 │ WebRTC (RTCPeerConnection) + RTCRtpScriptTransform+SFrame│
 │ Vitest 4 (unit-тесты крипты/media)                      │
@@ -105,16 +105,17 @@
 - **replaceTrack** вместо renegotiation — дешёвое переключение «кто говорит» в
   полном-меш-рации (ptt.ts:109-130).
 
-## 7. Фронтенд: React 19 + Vite 6 + Leaflet 1.9
+## 7. Фронтенд: React 19 + Vite 6 + OpenLayers
 
 - **React 19** — стандарт UI; SPA без routing-либ (вкладки в `App.tsx`).
 - **Vite 6** — сборщик и dev-сервер (:5173, proxy → :8080); быстрый, стабильный.
   Прод — статические файлы в embed, никакого Node на узле.
 - **TypeScript 5.7** — типы для криптографических данных и договорных форматов (`types.ts` —
   маркеры/зоны/алерты/фреймы).
-- **Leaflet 1.9**: лёгкая офлайн-карта, circleMarker/полигоны зон, попапы без
-  тяжёлой векторной обвязки; XYZ-поток тайлов из embed офлайн. Чистый ESM,
-  встраивается в сборку Vite с одним CSS-импортом.
+- **OpenLayers**: офлайн-карта с двумя слоями (`/tiles/osm|sat/{z}/{x}/{y}.png`),
+  векторные маркеры/зоны, React-попапы через Overlay; XYZ-поток тайлов из embed +
+  `data/tiles/` офлайн. Докачка области — серверным воркером (`POST
+  /api/v1/admin/tiles/fetch`, см. `04-deployment`), когда у узла есть интернет.
 - **Vitest 4** — юнит-тесты крипты (e2ee/signal/content/sframe) без e2e-хопов.
 - **PWA**: manifest + иконка (без service worker — офлайн-кэш обеспечивают
   встроенные тайлы, а не SW; минимальный PWA-профиль).
